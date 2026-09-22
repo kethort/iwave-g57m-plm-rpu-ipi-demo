@@ -581,6 +581,17 @@ def overlay_rust_rpu_sources(
     use_symlinks: bool,
 ) -> None:
     """Expose Rust sources in the Vitis component without copying Cargo output."""
+    template_sources = (
+        app_source_root / "main.c",
+        app_source_root / "helloworld.c",
+        app_source_root / "Empty_application.c",
+        app_source_root / "Empty_applicationExample.c",
+    )
+    for template_source in template_sources:
+        if template_source.exists() or template_source.is_symlink():
+            remove_path(template_source)
+            info(f"Removed generated C template source: {template_source}")
+
     entries = (
         cargo_root / "Cargo.toml",
         cargo_root / "Cargo.lock",
@@ -610,6 +621,18 @@ def overlay_rust_rpu_sources(
         else:
             shutil.copy2(source, destination)
             info(f"Copied {source} -> {destination}")
+
+    readme = app_source_root / "README.txt"
+    readme.write_text(
+        "This Vitis application component is a container for the Rust RPU "
+        "firmware.\n\n"
+        "The real application source is under src/rust, and build-plm builds "
+        "it with Cargo. The generated ELF is copied to this component's build "
+        "directory so Vitis launch/debug metadata can still refer to the "
+        "component output.\n",
+        encoding="utf-8",
+    )
+    info(f"Wrote Rust RPU component note: {readme}")
 
 
 def derive_vitis_root() -> Path:

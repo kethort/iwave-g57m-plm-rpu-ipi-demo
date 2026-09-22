@@ -71,6 +71,11 @@ function, builds `plm.elf`, creates an RPU Vitis application, exposes the Rust
 workspace to the generated component, builds the RPU ELF with Cargo, and emits
 PDI artifacts.
 
+The generated Vitis RPU application component is only a debug/container
+component for the Rust firmware. For Rust builds, `plm/build-plm` removes the
+empty-application C template, exposes the Cargo workspace under the component,
+and copies the Cargo-built ELF to the component's `build/` directory.
+
 Typical outputs:
 
 ```text
