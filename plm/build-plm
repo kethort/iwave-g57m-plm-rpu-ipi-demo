@@ -1081,7 +1081,7 @@ def patch_launch_tree(
 
             if isinstance(attach_options, dict):
                 attach_defaults = {
-                    "targetSetupMode": "Attach to Running Target",
+                    "targetSetupMode": "attach",
                     "executeScript": False,
                     "scriptPath": "",
                     "resetProcessor": False,
