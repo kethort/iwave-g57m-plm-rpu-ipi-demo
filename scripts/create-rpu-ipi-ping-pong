@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+"""Create and build a Vitis Unified RPU IPI ping-pong application.
+
+Run with Vitis Unified 2025.2, for example:
+
+    vitis -s ./scripts/create-rpu-ipi-ping-pong \
+        --xsa ./vck190_rndesp_61626.xsa \
+        --workspace ./rpu_ipi_workspace \
+        --launch-vitis
+
+The generated firmware waits for an interrupt from the PMC/PLM IPI agent,
+clears it, waits for a configurable delay, and triggers an interrupt back to
+the PMC agent. The output ELF is printed at the end of the build.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Iterable, Optional
+
+
+DEFAULT_PLATFORM_NAME = "rpu_ipi_platform"
+DEFAULT_APP_NAME = "rpu_ipi_ping_pong"
+DEFAULT_PROCESSOR = "psv_cortexr5_0"
+DEFAULT_DOMAIN = "standalone_psv_cortexr5_0"
+DEFAULT_TEMPLATE = "empty_application"
+
+
+def info(message: str) -> None:
+    print(f"[INFO] {message}", flush=True)
+
+
+def success(message: str) -> None:
+    print(f"[SUCCESS] {message}", flush=True)
+
+
+def fail(message: str) -> None:
+    raise RuntimeError(message)
+
+
+def absolute_path(value: str | Path) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def call_first_supported(
+    owner: object,
+    method_names: Iterable[str],
+    argument_sets: Iterable[dict],
+) -> object:
+    last_error: Optional[Exception] = None
+    found_method = False
+
+    for method_name in method_names:
+        method = getattr(owner, method_name, None)
+        if method is None:
+            continue
+        found_method = True
+
+        for kwargs in argument_sets:
+            try:
+                return method(**kwargs)
+            except Exception as error:
+                last_error = error
+
+    if not found_method:
+        fail(f"None of these Vitis methods exist: {', '.join(method_names)}")
+    if last_error is not None:
+        raise last_error
+    fail("No supported Vitis API call succeeded")
+
+
+def get_existing_component(client: object, name: str, kind: str) -> object:
+    if kind == "platform":
+        methods = ("get_platform_component", "get_platform", "get_component")
+    else:
+        methods = (
+            "get_app_component",
+            "get_application_component",
+            "get_component",
+        )
+
+    return call_first_supported(
+        client,
+        methods,
+        ({"name": name}, {"component_name": name}),
+    )
+
+
+def build_component(component: object, label: str) -> None:
+    info(f"Building {label}")
+    result = component.build()
+
+    if result is None:
+        return
+    if isinstance(result, bool):
+        if not result:
+            fail(f"{label} build failed")
+        return
+    if isinstance(result, int):
+        if result != 0:
+            fail(f"{label} build failed with return code {result}")
+        return
+    if isinstance(result, str):
+        if result.strip().lower() in {"0", "success", "succeeded", "true"}:
+            return
+        fail(f"{label} build failed with result: {result}")
+
+    fail(f"Unsupported {label} build result: {result!r}")
+
+
+def export_platform(platform: object) -> None:
+    method = getattr(platform, "export", None)
+    if method is None:
+        info("Platform has no export() method; using build output")
+        return
+    info("Exporting RPU platform")
+    method()
+
+
+def resolve_exported_platform(workspace: Path, platform_name: str) -> Path:
+    expected = workspace / platform_name / "export" / platform_name / "platform.xpfm"
+    if expected.is_file():
+        return expected.resolve()
+
+    candidates = sorted((workspace / platform_name).glob("export/**/*.xpfm"))
+    if candidates:
+        return candidates[0].resolve()
+
+    fail(f"Unable to locate exported platform below {workspace / platform_name}")
+
+
+def add_platform_repository(client: object, xpfm: Path) -> None:
+    repository = xpfm.parent
+    try:
+        call_first_supported(
+            client,
+            ("add_platform_repos", "add_platform_repo"),
+            (
+                {"platform_repos": [str(repository)]},
+                {"platform_repo": [str(repository)]},
+                {"repos": [str(repository)]},
+            ),
+        )
+        info(f"Added platform repository: {repository}")
+    except Exception as error:
+        info(f"Platform repository is already registered or not required: {error}")
+
+
+def create_platform(
+    client: object,
+    xsa: Path,
+    platform_name: str,
+    processor: str,
+    domain: str,
+) -> object:
+    info(f"Creating platform component '{platform_name}'")
+    return call_first_supported(
+        client,
+        ("create_platform_component",),
+        (
+            {
+                "name": platform_name,
+                "hw_design": str(xsa),
+                "os": "standalone",
+                "cpu": processor,
+                "domain_name": domain,
+            },
+            {
+                "name": platform_name,
+                "hw": str(xsa),
+                "os": "standalone",
+                "cpu": processor,
+                "domain_name": domain,
+            },
+            {
+                "name": platform_name,
+                "hw_design": str(xsa),
+                "os": "standalone",
+                "cpu": processor,
+            },
+        ),
+    )
+
+
+def create_application(
+    client: object,
+    xpfm: Path,
+    app_name: str,
+    domain: str,
+    template: str,
+) -> object:
+    info(f"Creating application component '{app_name}'")
+    return call_first_supported(
+        client,
+        ("create_app_component", "create_application_component"),
+        (
+            {
+                "name": app_name,
+                "platform": str(xpfm),
+                "domain": domain,
+                "template": template,
+            },
+            {
+                "name": app_name,
+                "platform": xpfm.stem,
+                "domain": domain,
+                "template": template,
+            },
+        ),
+    )
+
+
+def firmware_source(reply_delay_us: int) -> str:
+    return f'''#include "sleep.h"
+#include "xil_exception.h"
+#include "xil_printf.h"
+#include "xipipsu.h"
+#include "xparameters.h"
+#include "xscugic.h"
+#include "xstatus.h"
+
+/*
+ * For the current Versal IPI mapping:
+ *   PMC/PLM agent mask: 0x00000002
+ *   RPU IPI1 agent mask: 0x00000008
+ *
+ * At the RPU/IPI1 destination, the status bit identifies the PMC source,
+ * therefore the RPU recognizes and clears bit 1 (0x2). To reply, the RPU
+ * also supplies the PMC destination mask (0x2) to XIpiPsu_TriggerIpi().
+ */
+#define PMC_SOURCE_MASK       (0x00000002U)
+#define PMC_DESTINATION_MASK  (0x00000002U)
+#define RPU_REPLY_DELAY_US    ({reply_delay_us}U)
+
+static XIpiPsu IpiInstance;
+static XScuGic GicInstance;
+
+static volatile u32 ReceiveCount;
+static volatile u32 ReplyPending;
+
+static void RpuIpiHandler(void *CallbackReference)
+{{
+    XIpiPsu *IpiPtr = (XIpiPsu *)CallbackReference;
+    u32 Status = XIpiPsu_GetInterruptStatus(IpiPtr);
+
+    if ((Status & PMC_SOURCE_MASK) != 0U) {{
+        XIpiPsu_ClearInterruptStatus(IpiPtr, PMC_SOURCE_MASK);
+        ReceiveCount++;
+        ReplyPending = 1U;
+    }}
+}}
+
+static int InitializeIpi(void)
+{{
+    XIpiPsu_Config *Config;
+    int Status;
+
+#if defined(XPAR_XIPIPSU_0_DEVICE_ID)
+    Config = XIpiPsu_LookupConfig(XPAR_XIPIPSU_0_BASEADDR);
+#elif defined(XPAR_XIPIPSU_0_BASEADDR)
+    Config = XIpiPsu_LookupConfig(XPAR_XIPIPSU_0_BASEADDR);
+#else
+#error "No XIpiPsu device identifier or base address is available in xparameters.h"
+#endif
+    if (Config == NULL) {{
+        xil_printf("RPU IPI: ERROR: no XIpiPsu configuration\\r\\n");
+        return XST_FAILURE;
+    }}
+
+    Status = XIpiPsu_CfgInitialize(
+        &IpiInstance,
+        Config,
+        Config->BaseAddress
+    );
+    if (Status != XST_SUCCESS) {{
+        xil_printf(
+            "RPU IPI: ERROR: XIpiPsu_CfgInitialize returned 0x%08lx\\r\\n",
+            (unsigned long)Status
+        );
+        return Status;
+    }}
+
+    xil_printf("RPU IPI: peripheral initialized\\r\\n");
+    xil_printf(
+        "RPU IPI: base=0x%08lx local-mask=0x%08lx int-id=%lu\\r\\n",
+        (unsigned long)Config->BaseAddress,
+        (unsigned long)Config->BitMask,
+        (unsigned long)Config->IntId
+    );
+
+    return XST_SUCCESS;
+}}
+
+static int InitializeInterruptController(void)
+{{
+    XScuGic_Config *Config;
+    int Status;
+
+#if defined(XPAR_SCUGIC_SINGLE_DEVICE_ID)
+    Config = XScuGic_LookupConfig(XPAR_SCUGIC_SINGLE_DEVICE_ID);
+#elif defined(XPAR_XSCUGIC_0_DEVICE_ID)
+    Config = XScuGic_LookupConfig(XPAR_XSCUGIC_0_DEVICE_ID);
+#elif defined(XPAR_XSCUGIC_0_BASEADDR)
+    Config = XScuGic_LookupConfig(XPAR_XSCUGIC_0_BASEADDR);
+#else
+#error "No XScuGic device identifier or base address is available in xparameters.h"
+#endif
+    if (Config == NULL) {{
+        xil_printf("RPU IPI: ERROR: no GIC configuration\\r\\n");
+        return XST_FAILURE;
+    }}
+
+    Status = XScuGic_CfgInitialize(
+        &GicInstance,
+        Config,
+        Config->CpuBaseAddress
+    );
+    if (Status != XST_SUCCESS) {{
+        xil_printf(
+            "RPU IPI: ERROR: XScuGic_CfgInitialize returned 0x%08lx\\r\\n",
+            (unsigned long)Status
+        );
+        return Status;
+    }}
+
+    Xil_ExceptionInit();
+    Xil_ExceptionRegisterHandler(
+        XIL_EXCEPTION_ID_INT,
+        (Xil_ExceptionHandler)XScuGic_InterruptHandler,
+        &GicInstance
+    );
+
+    Status = XScuGic_Connect(
+        &GicInstance,
+        IpiInstance.Config.IntId,
+        (Xil_InterruptHandler)RpuIpiHandler,
+        &IpiInstance
+    );
+    if (Status != XST_SUCCESS) {{
+        xil_printf(
+            "RPU IPI: ERROR: XScuGic_Connect returned 0x%08lx\\r\\n",
+            (unsigned long)Status
+        );
+        return Status;
+    }}
+
+    XScuGic_SetPriorityTriggerType(
+        &GicInstance,
+        IpiInstance.Config.IntId,
+        0xA0U,
+        0x1U
+    );
+    XScuGic_Enable(&GicInstance, IpiInstance.Config.IntId);
+    Xil_ExceptionEnable();
+
+    xil_printf("RPU IPI: GIC interrupt enabled\\r\\n");
+    return XST_SUCCESS;
+}}
+
+int main(void)
+{{
+    int Status;
+    u32 LastReportedCount = 0U;
+
+    xil_printf("\\r\\n========================================\\r\\n");
+    xil_printf("RPU IPI PING-PONG TEST\\r\\n");
+    xil_printf("========================================\\r\\n");
+
+    ReceiveCount = 0U;
+    ReplyPending = 0U;
+
+    Status = InitializeIpi();
+    if (Status != XST_SUCCESS) {{
+        return Status;
+    }}
+
+    XIpiPsu_InterruptDisable(&IpiInstance, PMC_SOURCE_MASK);
+    XIpiPsu_ClearInterruptStatus(&IpiInstance, PMC_SOURCE_MASK);
+
+    Status = InitializeInterruptController();
+    if (Status != XST_SUCCESS) {{
+        return Status;
+    }}
+
+    XIpiPsu_InterruptEnable(&IpiInstance, PMC_SOURCE_MASK);
+
+    xil_printf(
+        "RPU IPI: PMC source enabled, mask=0x%08lx\\r\\n",
+        (unsigned long)PMC_SOURCE_MASK
+    );
+    xil_printf("RPU IPI: waiting for PLM interrupt...\\r\\n");
+
+    for (;;) {{
+        if (ReceiveCount != LastReportedCount) {{
+            LastReportedCount = ReceiveCount;
+            xil_printf(
+                "RPU IPI: received PLM interrupt #%lu\\r\\n",
+                (unsigned long)LastReportedCount
+            );
+        }}
+
+        if (ReplyPending != 0U) {{
+            ReplyPending = 0U;
+
+            xil_printf(
+                "RPU IPI: delaying %lu us before reply\\r\\n",
+                (unsigned long)RPU_REPLY_DELAY_US
+            );
+            usleep(RPU_REPLY_DELAY_US);
+
+            Status = XIpiPsu_TriggerIpi(
+                &IpiInstance,
+                PMC_DESTINATION_MASK
+            );
+            if (Status == XST_SUCCESS) {{
+                xil_printf(
+                    "RPU IPI: reply #%lu sent to PLM/PMC\\r\\n",
+                    (unsigned long)LastReportedCount
+                );
+            }} else {{
+                xil_printf(
+                    "RPU IPI: ERROR: reply trigger returned 0x%08lx\\r\\n",
+                    (unsigned long)Status
+                );
+            }}
+        }}
+
+        usleep(1000U);
+    }}
+}}
+'''
+
+
+def write_firmware(app_dir: Path, reply_delay_us: int) -> Path:
+    source_dir = app_dir / "src"
+    source_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove template main files so there is exactly one main().
+    for candidate in source_dir.glob("**/*"):
+        if candidate.is_file() and candidate.name.lower() in {
+            "helloworld.c",
+            "main.c",
+        }:
+            candidate.unlink()
+
+    output = source_dir / "main.c"
+    output.write_text(firmware_source(reply_delay_us), encoding="utf-8")
+    info(f"Generated firmware source: {output}")
+    return output
+
+
+def find_elf(app_dir: Path, app_name: str) -> Path:
+    expected = app_dir / "build" / f"{app_name}.elf"
+    if expected.is_file():
+        return expected.resolve()
+
+    candidates = sorted((app_dir / "build").glob("*.elf"))
+    if len(candidates) == 1:
+        return candidates[0].resolve()
+
+    listing = "\n".join(f"  {path}" for path in candidates) or "  none"
+    fail(f"Unable to locate a unique RPU ELF. Candidates:\n{listing}")
+
+
+def locate_vitis() -> Optional[Path]:
+    command = shutil.which("vitis")
+    if command:
+        return Path(command).resolve()
+    root = os.environ.get("XILINX_VITIS")
+    if root:
+        candidate = Path(root) / "bin" / "vitis"
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def launch_vitis(workspace: Path) -> None:
+    launcher = locate_vitis()
+    if launcher is None:
+        fail("Unable to locate Vitis. Source the Vitis 2025.2 settings64.sh file.")
+
+    info(f"Launching Vitis workspace: {workspace}")
+    subprocess.Popen(
+        [str(launcher), "-w", str(workspace)],
+        cwd=str(workspace),
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Create and build a standalone Versal RPU IPI ping-pong app"
+    )
+    parser.add_argument("--xsa", required=True, help="Input Versal XSA")
+    parser.add_argument(
+        "--workspace",
+        default="rpu_ipi_workspace",
+        help="Vitis workspace directory (default: rpu_ipi_workspace)",
+    )
+    parser.add_argument(
+        "--platform-name",
+        default=DEFAULT_PLATFORM_NAME,
+        help=f"Platform component name (default: {DEFAULT_PLATFORM_NAME})",
+    )
+    parser.add_argument(
+        "--app-name",
+        default=DEFAULT_APP_NAME,
+        help=f"Application component name (default: {DEFAULT_APP_NAME})",
+    )
+    parser.add_argument(
+        "--processor",
+        default=DEFAULT_PROCESSOR,
+        help=f"RPU processor name (default: {DEFAULT_PROCESSOR})",
+    )
+    parser.add_argument(
+        "--domain",
+        default=DEFAULT_DOMAIN,
+        help=f"Standalone domain name (default: {DEFAULT_DOMAIN})",
+    )
+    parser.add_argument(
+        "--template",
+        default=DEFAULT_TEMPLATE,
+        help=f"Application template (default: {DEFAULT_TEMPLATE})",
+    )
+    parser.add_argument(
+        "--reply-delay-us",
+        type=int,
+        default=500000,
+        help="Delay before RPU replies to PLM, in microseconds (default: 500000)",
+    )
+    parser.add_argument(
+        "--force-regenerate",
+        action="store_true",
+        help="Delete and recreate the platform and application components",
+    )
+    parser.add_argument(
+        "--launch-vitis",
+        action="store_true",
+        help="Open the generated workspace in the Vitis GUI after building",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    xsa = absolute_path(args.xsa)
+    workspace = absolute_path(args.workspace)
+
+    if not xsa.is_file():
+        fail(f"XSA not found: {xsa}")
+    if args.reply_delay_us < 0:
+        fail("--reply-delay-us cannot be negative")
+
+    platform_dir = workspace / args.platform_name
+    app_dir = workspace / args.app_name
+
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    if args.force_regenerate:
+        for path in (app_dir, platform_dir):
+            if path.exists() or path.is_symlink():
+                info(f"Removing existing component: {path}")
+                remove_path(path)
+
+    try:
+        import vitis
+    except ImportError as error:
+        raise RuntimeError(
+            "The Vitis Python module is unavailable. Run this script with "
+            "'vitis -s', not with host python3."
+        ) from error
+
+    info(f"Workspace: {workspace}")
+    info(f"XSA: {xsa}")
+    info(f"Processor/domain: {args.processor}/{args.domain}")
+
+    client = vitis.create_client()
+    try:
+        client.set_workspace(path=str(workspace))
+
+        if platform_dir.is_dir():
+            info(f"Reusing platform component '{args.platform_name}'")
+            platform = get_existing_component(client, args.platform_name, "platform")
+        else:
+            platform = create_platform(
+                client,
+                xsa,
+                args.platform_name,
+                args.processor,
+                args.domain,
+            )
+
+        build_component(platform, "RPU platform")
+        export_platform(platform)
+        xpfm = resolve_exported_platform(workspace, args.platform_name)
+        success(f"RPU platform ready: {xpfm}")
+        add_platform_repository(client, xpfm)
+
+        if app_dir.is_dir():
+            info(f"Reusing application component '{args.app_name}'")
+            app = get_existing_component(client, args.app_name, "application")
+        else:
+            app = create_application(
+                client,
+                xpfm,
+                args.app_name,
+                args.domain,
+                args.template,
+            )
+
+        write_firmware(app_dir, args.reply_delay_us)
+
+        stale_elf = app_dir / "build" / f"{args.app_name}.elf"
+        if stale_elf.exists() or stale_elf.is_symlink():
+            stale_elf.unlink()
+
+        build_component(app, "RPU IPI ping-pong application")
+        elf = find_elf(app_dir, args.app_name)
+
+        success(f"RPU IPI ping-pong ELF: {elf}")
+        print("", flush=True)
+        print("Use this with the PLM packaging script:", flush=True)
+        print(f"  --rpu-elf {elf}", flush=True)
+
+    finally:
+        close = getattr(client, "close", None)
+        if close is not None:
+            close()
+
+    if args.launch_vitis:
+        launch_vitis(workspace)
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("[ERROR] Interrupted", file=sys.stderr)
+        raise SystemExit(130)
+    except Exception as error:
+        print(f"[ERROR] {error}", file=sys.stderr)
+        raise SystemExit(1)

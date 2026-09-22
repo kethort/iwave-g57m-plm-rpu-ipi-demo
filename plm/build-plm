@@ -44,10 +44,9 @@ Build the PLM IPI user module and its R5-0 peer application:
         --force-regenerate \
         --launch-vitis
 
-By default, the Vitis debug PDI contains only the custom PLM. The PLM launch
-configuration programs that PDI and uses the PLM ELF for symbols only. The
-RPU application is built as a separate Vitis component and is not loaded by
-the PLM launch.
+By default, the Vitis launch configurations are patched for attach-to-running
+debug. The PLM and RPU ELFs are used for symbols/source mapping while firmware
+is loaded by the PDI, JTAG, or remoteproc flow.
 
 Pass --embed-rpu-in-pdi to additionally generate a production-style combined
 PDI that boots both the PLM and RPU without the debugger. The combined PDI is
@@ -592,6 +591,9 @@ def overlay_rust_rpu_sources(
             remove_path(template_source)
             info(f"Removed generated C template source: {template_source}")
 
+    rust_root = app_source_root / "rust"
+    rust_root.mkdir(parents=True, exist_ok=True)
+
     entries = (
         cargo_root / "Cargo.toml",
         cargo_root / "Cargo.lock",
@@ -599,8 +601,6 @@ def overlay_rust_rpu_sources(
         cargo_root / "bsp_bindings",
         cargo_root / package_name,
     )
-    rust_root = app_source_root / "rust"
-    rust_root.mkdir(parents=True, exist_ok=True)
 
     for source in entries:
         if not source.exists():
@@ -626,10 +626,12 @@ def overlay_rust_rpu_sources(
     readme.write_text(
         "This Vitis application component is a container for the Rust RPU "
         "firmware.\n\n"
-        "The real application source is under src/rust, and build-plm builds "
-        "it with Cargo. The generated ELF is copied to this component's build "
-        "directory so Vitis launch/debug metadata can still refer to the "
-        "component output.\n",
+        "The source tree shown here is a symlink mirror of the real Cargo "
+        "workspace:\n"
+        f"{cargo_root.resolve()}\n\n"
+        "build-plm maps debugger source paths from the real Cargo workspace to "
+        "this Explorer-visible tree, then copies the generated ELF to this "
+        "component's build directory.\n",
         encoding="utf-8",
     )
     info(f"Wrote Rust RPU component note: {readme}")
@@ -924,8 +926,8 @@ def patch_launch_tree(
 ) -> tuple[object, int]:
     if attach_to_running:
         replacements = {
-            "targetsetupmode": "Attach to Running Target",
-            "setuptype": "Attach to Running Target",
+            "targetsetupmode": "Attach to running target",
+            "setuptype": "Attach to running target",
         }
         true_keys: set[str] = set()
         false_keys = {
@@ -941,10 +943,9 @@ def patch_launch_tree(
             "runafterdownload",
         }
     else:
-        # Match the previously validated PLM debug flow: program the generated
-        # PDI and halt the MicroBlaze PPU at the PLM ELF entry point. Do not
-        # force application download because the PLM executable is loaded by
-        # the PDI; the ELF is used by Vitis for symbols and source mapping.
+        # Kept for callers that explicitly want a programming launch. The
+        # default patch_launch_configs path now uses attach-to-running for both
+        # PLM and RPU so the ELFs are used for symbols/source mapping only.
         replacements = {}
         true_keys = {
             "programdevice",
@@ -1020,7 +1021,7 @@ def patch_launch_tree(
         if is_launch_config:
             if attach_to_running:
                 required_values = {
-                    "targetSetupMode": "Attach to Running Target",
+                    "targetSetupMode": "Attach to running target",
                     "resetEntireSystem": False,
                     "resetProcessor": False,
                     "programDevice": False,
@@ -1080,7 +1081,7 @@ def patch_launch_tree(
 
             if isinstance(attach_options, dict):
                 attach_defaults = {
-                    "targetSetupMode": "Attach to Running Target",
+                    "targetSetupMode": "Attach to running target",
                     "executeScript": False,
                     "scriptPath": "",
                     "resetProcessor": False,
@@ -1154,6 +1155,84 @@ def remove_plm_attach_configuration(data: object) -> tuple[object, int]:
     return data, removed
 
 
+def remove_plm_attach_target_setup(data: object) -> tuple[object, int]:
+    """Remove programming/download metadata from the PLM attach launch."""
+    if not isinstance(data, dict):
+        return data, 0
+
+    changes = 0
+
+    configurations = data.get("configurations")
+    if isinstance(configurations, list):
+        for configuration in configurations:
+            if not isinstance(configuration, dict):
+                continue
+            target_setup_key = next(
+                (
+                    key
+                    for key in configuration
+                    if normalized_key(key) == "targetsetup"
+                ),
+                None,
+            )
+            if target_setup_key is not None:
+                del configuration[target_setup_key]
+                changes += 1
+
+    return data, changes
+
+
+def patch_rpu_source_path_map(
+    node: object,
+    path_map: list[dict[str, str]],
+) -> tuple[object, int]:
+    changes = 0
+
+    if isinstance(node, dict):
+        result: dict[str, object] = {}
+
+        for key, value in node.items():
+            if normalized_key(key) == "pathmap":
+                if value != path_map:
+                    value = path_map
+                    changes += 1
+            else:
+                value, nested_changes = patch_rpu_source_path_map(
+                    value,
+                    path_map,
+                )
+                changes += nested_changes
+            result[key] = value
+
+        normalized_keys = {normalized_key(key) for key in result}
+        is_launch_config = (
+            "debugtype" in normalized_keys
+            or (
+                "request" in normalized_keys
+                and "type" in normalized_keys
+                and "name" in normalized_keys
+            )
+        )
+        if is_launch_config and "pathmap" not in normalized_keys:
+            result["pathMap"] = path_map
+            changes += 1
+
+        return result, changes
+
+    if isinstance(node, list):
+        result_list: list[object] = []
+        for item in node:
+            patched_item, nested_changes = patch_rpu_source_path_map(
+                item,
+                path_map,
+            )
+            result_list.append(patched_item)
+            changes += nested_changes
+        return result_list, changes
+
+    return node, changes
+
+
 
 def patch_launch_configs(
     workspace: Path,
@@ -1162,6 +1241,7 @@ def patch_launch_configs(
     rpu_app_name: Optional[str] = None,
     rpu_processor: Optional[str] = None,
     rpu_elf: Optional[Path] = None,
+    rpu_source_root: Optional[Path] = None,
 ) -> None:
     launch_files = [
         path
@@ -1185,6 +1265,19 @@ def patch_launch_configs(
             "${workspaceFolder}/" + relative_rpu_elf.as_posix()
         )
 
+    rpu_path_map: Optional[list[dict[str, str]]] = None
+    if rpu_application_dir is not None and rpu_source_root is not None:
+        component_source = (
+            rpu_application_dir / "src" / "rust"
+        ).resolve(strict=False).as_posix()
+        real_source = rpu_source_root.resolve(strict=False).as_posix()
+        rpu_path_map = [
+            {
+                "source": real_source,
+                "destination": component_source,
+            }
+        ]
+
     for path in launch_files:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -1202,15 +1295,24 @@ def patch_launch_configs(
             except ValueError:
                 pass
 
-        # Classify by component path, not by launch contents. The RPU launch
-        # lives beneath the RPU application component; the PLM launch does not.
+        # Classify by component path for messaging and RPU-specific cleanup.
+        # Both PLM and RPU launches attach to already-running firmware by
+        # default.
         is_rpu_launch = path_is_rpu
+        attach_to_running = True
 
         patched, changes = patch_launch_tree(
             data,
-            attach_to_running=is_rpu_launch,
+            attach_to_running=attach_to_running,
             pdi_workspace_path=pdi_workspace_path,
         )
+
+        if is_rpu_launch and rpu_path_map is not None:
+            patched, path_map_changes = patch_rpu_source_path_map(
+                patched,
+                rpu_path_map,
+            )
+            changes += path_map_changes
 
         if not is_rpu_launch:
             try:
@@ -1221,6 +1323,10 @@ def patch_launch_configs(
                     patched
                 )
                 changes += removed_changes
+                patched, removed_target_setup_changes = (
+                    remove_plm_attach_target_setup(patched)
+                )
+                changes += removed_target_setup_changes
                 if (
                     rpu_processor is not None
                     and rpu_app_name is not None
@@ -1284,7 +1390,7 @@ def patch_launch_configs(
                 pass
 
         if changes == 0:
-            mode = "RPU attach" if is_rpu_launch else "PLM"
+            mode = "RPU attach" if is_rpu_launch else "PLM attach"
             info(f"Launch config already has {mode} settings: {path}")
             continue
 
@@ -1295,7 +1401,7 @@ def patch_launch_configs(
         if is_rpu_launch:
             success(f"Configured RPU attach-to-running launch: {path}")
         else:
-            info(f"Updated PLM launch config: {path}")
+            success(f"Configured PLM attach-to-running launch: {path}")
 
 
 def read_process_cmdline(pid: int) -> str:
@@ -2865,6 +2971,11 @@ def main() -> int:
                 else None
             ),
             rpu_elf=packaged_rpu_elf,
+            rpu_source_root=(
+                rpu_source
+                if packaged_rpu_elf is not None and rpu_source_is_rust
+                else None
+            ),
         )
 
     finally:

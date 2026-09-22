@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+set -x
+
+script_dir="$(dirname "$(readlink -f -- "$0")")"
+project_dir="$(dirname "${script_dir}")"
+
+plm_target="${project_dir}/plm/build/plm/build/plm.elf"
+rpu_target="${project_dir}/plm/rpu-app/target/armv7r-none-eabihf/debug/rpu_ipi_ping_pong"
+xsa_path="${XSA_PATH:-${project_dir}/system.xsa}"
+workspace="${project_dir}/plm/build"
+custom_source_dir="${project_dir}/plm/src"
+boot_bin="${project_dir}/BOOT.BIN"
+bif_file="${project_dir}/output.bif"
+tcl_script="${project_dir}/rpu_app_jtag.tcl"
+plm_log_file="${project_dir}/plm.log"
+device="${SERIAL_DEVICE:-/dev/ttyUSB1}"
+vitis="${VITIS_BIN:-/tools/Xilinx/2025.2/Vitis/bin/vitis}"
+
+[[ -f "${xsa_path}" ]] || { echo "XSA not found: ${xsa_path}" >&2; exit 1; }
+[[ -x "${vitis}" ]] || { echo "Vitis launcher not found: ${vitis}" >&2; exit 1; }
+
+cd "${project_dir}/plm/rpu-app"
+export XSA_PATH="${xsa_path}"
+cargo build -p rpu_ipi_ping_pong
+
+plm_args=(
+    "${workspace}"
+    --xsa "${xsa_path}"
+    --custom-source-dir "${custom_source_dir}"
+    --symlink-sources
+    --register-module xplm_ipi_ping_pong_module.h:XPlm_IpiPingPongModuleInit
+    --user-modules-count 1
+    --rpu-source "${project_dir}/plm/rpu-app"
+    --rpu-app-name rpu_ipi_ping_pong
+    --rpu-cargo-package rpu_ipi_ping_pong
+    --rpu-platform-name rpu_platform
+    --rpu-processor psv_cortexr5_0
+    --rpu-domain standalone_psv_cortexr5_0
+    --rpu-core r5-0
+)
+
+# Recreate the PLM platform from the same XSA used by the RPU build when requested.
+# Default is enabled for the first corrected build. Set FORCE_REGENERATE=0 to reuse it later.
+if [[ "${FORCE_REGENERATE:-1}" == "1" ]]; then
+    plm_args+=(--force-regenerate)
+fi
+
+"${vitis}" -s "${project_dir}/plm/build-plm" "${plm_args[@]}"
+
+pdi_path="${workspace}/PLM_CUSTOM_JTAG.pdi"
+[[ -f "${pdi_path}" ]] || { echo "PLM PDI not found: ${pdi_path}" >&2; exit 1; }
+
+[[ -f "${plm_target}" ]] || { echo "PLM ELF not found: ${plm_target}" >&2; exit 1; }
+[[ -f "${rpu_target}" ]] || { echo "RPU ELF not found: ${rpu_target}" >&2; exit 1; }
+
+cat > "${bif_file}" <<EOF_BIF
+all: {
+    image {
+        name = pmc_subsys, id = 0x1c000001
+        { type = bootloader, file = ${plm_target} }
+        { type = bootimage, file = ${pdi_path} }
+    }
+    image {
+        id = 0x1c000000, name = def_subsystem
+        { core = r5-lockstep, file = ${rpu_target} }
+    }
+}
+EOF_BIF
+
+bootgen -arch versal -image "${bif_file}" -w -o "${boot_bin}"
+
+cat > "${tcl_script}" <<EOF_TCL
+#!/usr/bin/env xsdb
+connect
+
+targets -set -nocase -filter {name =~ "*PMC*"}
+rst -system
+
+proc dump_plm_log {log_file} {
+    if {[catch {set log_text [plm log]} message]} {
+        puts stderr "plm log failed: \$message"
+        return
+    }
+
+    if {\$log_text eq ""} {
+        puts stderr "PLM log is empty"
+        return
+    }
+
+    puts stderr "----- PLM LOG -----"
+    puts stderr \$log_text
+
+    if {\$log_file ne ""} {
+        set handle [open \$log_file w]
+        puts \$handle \$log_text
+        close \$handle
+        puts stderr "PLM log saved to \$log_file"
+    }
+}
+
+if {[catch {device program "${boot_bin}"} message]} {
+    puts stderr "device program failed: \$message"
+    dump_plm_log "${plm_log_file}"
+    exit 1
+}
+
+con
+EOF_TCL
+chmod +x "${tcl_script}"
+
+stty -F "${device}" 115200 raw -echo
+cat "${device}" &
+serial_pid=$!
+trap 'kill "${serial_pid}" 2>/dev/null || true' EXIT INT TERM
+
+"${tcl_script}"
+wait "${serial_pid}"
