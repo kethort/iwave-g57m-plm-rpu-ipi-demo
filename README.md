@@ -18,13 +18,13 @@ files are intentionally not tracked here.
 ```text
 plm/
 ├── build-plm
-├── src/
-│   └── common/
-│       ├── xplm_ipi_ping_pong_module.c
-│       └── xplm_ipi_ping_pong_module.h
-└── rpu-app/
-    └── src/
-        └── main.c
+└── src/
+    └── common/
+        ├── xplm_ipi_ping_pong_module.c
+        └── xplm_ipi_ping_pong_module.h
+rpu-app/
+└── src/
+    └── main.c
 ```
 
 `plm/build-plm` is a Vitis Python script. Run it through `vitis -s`; do not run
@@ -49,7 +49,7 @@ vitis -s ./plm/build-plm \
   --custom-source-dir ./plm/src \
   --register-module xplm_ipi_ping_pong_module.h:XPlm_IpiPingPongModuleInit \
   --user-modules-count 1 \
-  --rpu-source ./plm/rpu-app/src \
+  --rpu-source ./rpu-app/src \
   --rpu-app-name rpu_ipi_ping_pong \
   --rpu-platform-name rpu_platform \
   --rpu-processor psv_cortexr5_0 \
