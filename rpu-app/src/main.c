@@ -9,10 +9,17 @@
 
 #define USER_MODULE_ID           (0x80U)
 #define USER_RPU_API_ID          (1U)
-#define USER_COMMAND_HEADER      ((USER_MODULE_ID << 8U) | USER_RPU_API_ID)
+#define USER_COMMAND_LEN_SHIFT   (16U)
+#define USER_REQUEST_PAYLOADS    (3U)
+#define USER_COMMAND_HEADER      ((USER_REQUEST_PAYLOADS << USER_COMMAND_LEN_SHIFT) | \
+				  (USER_MODULE_ID << 8U) | USER_RPU_API_ID)
+#define USER_REQUEST_MAGIC       (0x52505531U)
+#define USER_RESPONSE_XOR        (0xA5A55A5AU)
+#define USER_ROTL32(Value, Shift) \
+	(((Value) << (Shift)) | ((Value) >> (32U - (Shift))))
 
-#define REQUEST_WORDS            (2U)
-#define RESPONSE_WORDS           (2U)
+#define REQUEST_WORDS            (1U + USER_REQUEST_PAYLOADS)
+#define RESPONSE_WORDS           (4U)
 #define TOTAL_PING_PONGS         (100U)
 #define RESPONSE_WAIT_ITERATIONS (100000000U)
 #define PLM_BOOT_SETTLE_SECONDS  (5U)
@@ -24,6 +31,8 @@
 static XIpiPsu Ipi;
 static volatile u32 ResponseReady;
 static volatile u32 ResponseValue;
+static volatile u32 ResponseSequence;
+static volatile u32 ResponseToken;
 static volatile int ResponseStatus;
 static volatile u32 IpiInterruptCount;
 
@@ -56,9 +65,13 @@ void __attribute__((noinline)) RpuIpiInterruptHandler(void *CallbackRef)
 	if (Status == XST_SUCCESS) {
 		ResponseStatus = (int)Response[0];
 		ResponseValue = Response[1];
+		ResponseSequence = Response[2];
+		ResponseToken = Response[3];
 	} else {
 		ResponseStatus = Status;
 		ResponseValue = 0U;
+		ResponseSequence = 0U;
+		ResponseToken = 0U;
 	}
 
 	IpiInterruptCount++;
@@ -105,9 +118,11 @@ static int IpiInit(void)
 	return XST_SUCCESS;
 }
 
-static int SendUserCommand(u32 Counter, u32 *Reply)
+static int SendUserCommand(u32 Counter, u32 Sequence, u32 *Reply)
 {
 	u32 Request[REQUEST_WORDS];
+	u32 RequestToken;
+	u32 ExpectedResponseToken;
 	u32 WaitCount;
 	int Status;
 
@@ -115,11 +130,19 @@ static int SendUserCommand(u32 Counter, u32 *Reply)
 		return XST_INVALID_PARAM;
 	}
 
-	Request[0] = USER_COMMAND_HEADER;
-	Request[1] = Counter;
+	RequestToken = USER_REQUEST_MAGIC ^
+		USER_ROTL32(Counter, 7U) ^
+		USER_ROTL32(Sequence, 19U);
+
+	Request[0U] = USER_COMMAND_HEADER;
+	Request[1U] = Counter;
+	Request[2U] = Sequence;
+	Request[3U] = RequestToken;
 
 	ResponseReady = 0U;
 	ResponseValue = 0U;
+	ResponseSequence = 0U;
+	ResponseToken = 0U;
 	ResponseStatus = XST_FAILURE;
 
 	Status = XIpiPsu_WriteMessage(
@@ -138,8 +161,10 @@ static int SendUserCommand(u32 Counter, u32 *Reply)
 	 * until its response interrupt returns ownership to this RPU.
 	 */
 	xil_printf(
-		"RPU: triggering PLM, counter=%lu\r\n",
-		(unsigned long)Counter
+		"RPU: triggering PLM, counter=%lu sequence=%lu token=0x%08lx\r\n",
+		(unsigned long)Counter,
+		(unsigned long)Sequence,
+		(unsigned long)RequestToken
 	);
 
 	Status = XIpiPsu_TriggerIpi(&Ipi, PMC_MASK);
@@ -161,14 +186,31 @@ static int SendUserCommand(u32 Counter, u32 *Reply)
 	}
 
 	xil_printf(
-		"RPU: ISR #%lu response status=0x%08lx value=%lu\r\n",
+		"RPU: ISR #%lu response status=0x%08lx value=%lu "
+		"sequence=%lu token=0x%08lx\r\n",
 		(unsigned long)IpiInterruptCount,
 		(unsigned long)ResponseStatus,
-		(unsigned long)ResponseValue
+		(unsigned long)ResponseValue,
+		(unsigned long)ResponseSequence,
+		(unsigned long)ResponseToken
 	);
 
 	if (ResponseStatus != XST_SUCCESS) {
 		return ResponseStatus;
+	}
+
+	ExpectedResponseToken = RequestToken ^ USER_RESPONSE_XOR;
+	if ((ResponseSequence != Sequence) ||
+	    (ResponseToken != ExpectedResponseToken)) {
+		xil_printf(
+			"RPU: invalid PLM response sequence=%lu token=0x%08lx, "
+			"expected sequence=%lu token=0x%08lx\r\n",
+			(unsigned long)ResponseSequence,
+			(unsigned long)ResponseToken,
+			(unsigned long)Sequence,
+			(unsigned long)ExpectedResponseToken
+		);
+		return XST_FAILURE;
 	}
 
 	*Reply = ResponseValue;
@@ -195,6 +237,8 @@ int main(void)
 	}
 
 	IpiInterruptCount = 0U;
+	ResponseSequence = 0U;
+	ResponseToken = 0U;
 
 	/*
 	 * PLM hands off the RPU image before its own boot tasks have all finished.
@@ -207,7 +251,7 @@ int main(void)
 	sleep(PLM_BOOT_SETTLE_SECONDS);
 
 	for (PingPong = 1U; PingPong <= TOTAL_PING_PONGS; PingPong++) {
-		Status = SendUserCommand(Counter, &Reply);
+		Status = SendUserCommand(Counter, PingPong, &Reply);
 		if (Status != XST_SUCCESS) {
 			xil_printf(
 				"RPU: ping-pong #%lu failed: 0x%08lx\r\n",
