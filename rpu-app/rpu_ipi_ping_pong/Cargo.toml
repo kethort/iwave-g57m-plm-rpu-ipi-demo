@@ -1,0 +1,17 @@
+[package]
+name = "rpu_ipi_ping_pong"
+version = "0.1.0"
+edition = "2021"
+autolib = false
+build = "build.rs"
+
+[features]
+default = []
+remoteproc = []
+
+[[bin]]
+name = "rpu_ipi_ping_pong"
+path = "src/main.rs"
+
+[dependencies]
+bsp_bindings = { path = "../bsp_bindings" }

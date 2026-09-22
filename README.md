@@ -23,8 +23,12 @@ plm/
         ├── xplm_ipi_ping_pong_module.c
         └── xplm_ipi_ping_pong_module.h
 rpu-app/
-└── src/
-    └── main.c
+├── Cargo.toml
+├── bsp_bindings/
+└── rpu_ipi_ping_pong/
+    └── src/
+        ├── main.rs
+        └── remoteproc.rs
 ```
 
 `plm/build-plm` is a Vitis Python script. Run it through `vitis -s`; do not run
@@ -49,8 +53,9 @@ vitis -s ./plm/build-plm \
   --custom-source-dir ./plm/src \
   --register-module xplm_ipi_ping_pong_module.h:XPlm_IpiPingPongModuleInit \
   --user-modules-count 1 \
-  --rpu-source ./rpu-app/src \
+  --rpu-source ./rpu-app \
   --rpu-app-name rpu_ipi_ping_pong \
+  --rpu-cargo-package rpu_ipi_ping_pong \
   --rpu-platform-name rpu_platform \
   --rpu-processor psv_cortexr5_0 \
   --rpu-domain standalone_psv_cortexr5_0 \
@@ -62,8 +67,9 @@ vitis -s ./plm/build-plm \
 
 The script creates or regenerates a PLM platform/application, overlays the
 custom PLM source, patches `XPlm_ModuleInit()` to call the user module init
-function, builds `plm.elf`, creates an RPU Vitis application, overlays the RPU
-source, builds the RPU ELF, and emits PDI artifacts.
+function, builds `plm.elf`, creates an RPU Vitis application, exposes the Rust
+workspace to the generated component, builds the RPU ELF with Cargo, and emits
+PDI artifacts.
 
 Typical outputs:
 
@@ -100,8 +106,14 @@ tracked PLM source remains a normal user module.
 ## Runtime Behavior
 
 The PLM user module registers a command under user module ID `0x80`, API `1`.
-The RPU sends a counter value over IPI, waits for the PLM response interrupt,
-checks that the reply increments the counter, and repeats the exchange.
+The Rust RPU firmware sends a counter value over IPI, waits for the PLM response
+interrupt, checks that the reply increments the counter, and repeats the
+exchange.
+
+When built through `plm/build-plm`, the Rust firmware is compiled with the
+`remoteproc` feature. That keeps a minimal `.resource_table` section in the ELF
+so Linux remoteproc can recognize the image even though this demo does not use
+RPMsg vrings or carveouts.
 
 The PLM response path explicitly sends the PLMI response and triggers the RPU
 after the response buffer is ready. This keeps the RPU interrupt-driven instead

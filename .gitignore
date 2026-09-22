@@ -9,6 +9,7 @@ build/
 *.bif
 *.bin
 *.xsa
+target/
 
 # Editor and OS noise
 .vscode/
