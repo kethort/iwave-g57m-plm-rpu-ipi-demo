@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "bsp_bindings",
+    "rpu_ipi_ping_pong",
+]
+
+[profile.dev]
+opt-level = 0
+debug = 2
+strip = "none"
+lto = false
+
+[profile.release]
+opt-level = 2
+debug = 2
+strip = "none"
+lto = false

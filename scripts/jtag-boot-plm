@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+HW_SERVER_HOST="${HW_SERVER_HOST:-127.0.0.1}"
+HW_SERVER_PORT="${HW_SERVER_PORT:-3121}"
+HW_SERVER_URL="${HW_SERVER_URL:-TCP:${HW_SERVER_HOST}:${HW_SERVER_PORT}}"
+
+TEMP_DIR=""
+HW_SERVER_PID=""
+HW_SERVER_STARTED_BY_SCRIPT=0
+EXPLICIT_XSA=""
+KEEP_HW_SERVER=0
+
+info()  { printf '[INFO] %s\n' "$*"; }
+warn()  { printf '[WARNING] %s\n' "$*" >&2; }
+error() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+
+usage()
+{
+	cat <<EOF_USAGE
+Usage:
+  ${SCRIPT_NAME} <workspace> [--xsa <hardware.xsa>] [--keep-hw-server]
+
+Arguments:
+  <workspace>          Vitis workspace containing plm/build/plm.elf
+
+Options:
+  --xsa <hardware.xsa> Use this XSA as the source of the base PDI.
+                       When omitted, the script searches the project tree.
+  --keep-hw-server     Leave hw_server running if this script starts it.
+  -h, --help           Show this help.
+
+Environment:
+  HW_SERVER_HOST       Default: 127.0.0.1
+  HW_SERVER_PORT       Default: 3121
+  HW_SERVER_URL        Default: TCP:127.0.0.1:3121
+EOF_USAGE
+}
+
+cleanup()
+{
+	local status=$?
+
+	if [[ "${KEEP_HW_SERVER}" != "1" &&
+	      "${HW_SERVER_STARTED_BY_SCRIPT}" == "1" &&
+	      -n "${HW_SERVER_PID}" ]] && kill -0 "${HW_SERVER_PID}" 2>/dev/null; then
+		info "Stopping hw_server started by ${SCRIPT_NAME}"
+		kill "${HW_SERVER_PID}" 2>/dev/null || true
+
+		for _ in {1..30}; do
+			kill -0 "${HW_SERVER_PID}" 2>/dev/null || break
+			sleep 0.1
+		done
+
+		if kill -0 "${HW_SERVER_PID}" 2>/dev/null; then
+			kill -KILL "${HW_SERVER_PID}" 2>/dev/null || true
+		fi
+
+		wait "${HW_SERVER_PID}" 2>/dev/null || true
+	fi
+
+	if [[ -n "${TEMP_DIR}" && -d "${TEMP_DIR}" ]]; then
+		rm -rf -- "${TEMP_DIR}"
+	fi
+
+	exit "${status}"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+require_command()
+{
+	command -v "$1" >/dev/null 2>&1 || error "required command not found in PATH: $1"
+}
+
+resolve_workspace()
+{
+	local requested="$1"
+	local candidate=""
+
+	if [[ -d "${requested}" ]]; then
+		candidate="${requested}"
+	elif [[ -d "${PROJECT_ROOT}/${requested}" ]]; then
+		candidate="${PROJECT_ROOT}/${requested}"
+	else
+		error "workspace not found: ${requested}"
+	fi
+
+	realpath -- "${candidate}"
+}
+
+resolve_xsa()
+{
+	local workspace="$1"
+	local workspace_parent
+	local candidate
+	local -a candidates=()
+
+	workspace_parent="$(dirname -- "${workspace}")"
+
+	if [[ -n "${EXPLICIT_XSA}" ]]; then
+		[[ -f "${EXPLICIT_XSA}" ]] || error "XSA not found: ${EXPLICIT_XSA}"
+		realpath -- "${EXPLICIT_XSA}"
+		return
+	fi
+
+	mapfile -t candidates < <(
+		find "${workspace_parent}" "${PROJECT_ROOT}" \
+			-maxdepth 3 \
+			-type f \
+			-name '*.xsa' \
+			-print 2>/dev/null | sort -u
+	)
+
+	if (( ${#candidates[@]} == 0 )); then
+		error "no XSA was found. Re-run with --xsa /absolute/path/to/design.xsa"
+	fi
+
+	if (( ${#candidates[@]} > 1 )); then
+		printf '[ERROR] multiple XSA files were found; specify one with --xsa:\n' >&2
+		for candidate in "${candidates[@]}"; do
+			printf '  %s\n' "${candidate}" >&2
+		done
+		exit 1
+	fi
+
+	realpath -- "${candidates[0]}"
+}
+
+extract_base_pdi_from_xsa()
+{
+	local xsa="$1"
+	local output_dir="$2"
+
+	python3 - "${xsa}" "${output_dir}" <<'PY'
+from __future__ import annotations
+
+import shutil
+import sys
+import zipfile
+from pathlib import Path
+
+xsa = Path(sys.argv[1]).resolve()
+out_dir = Path(sys.argv[2]).resolve()
+out_dir.mkdir(parents=True, exist_ok=True)
+
+try:
+    archive = zipfile.ZipFile(xsa)
+except zipfile.BadZipFile as exc:
+    raise SystemExit(f"[ERROR] XSA is not a readable ZIP archive: {xsa}: {exc}")
+
+with archive:
+    members = [name for name in archive.namelist() if name.lower().endswith(".pdi")]
+
+    if not members:
+        raise SystemExit(
+            "[ERROR] no PDI was found inside the XSA. "
+            "The XSA must be exported with the Versal device image included."
+        )
+
+    preferred = [
+        name for name in members
+        if Path(name).name.lower() in {"system.pdi", "design.pdi"}
+    ]
+
+    if len(preferred) == 1:
+        selected = preferred[0]
+    elif len(members) == 1:
+        selected = members[0]
+    else:
+        listing = "\n".join(f"  {name}" for name in members)
+        raise SystemExit(
+            "[ERROR] multiple PDI files were found inside the XSA and no unique "
+            f"base PDI could be selected:\n{listing}"
+        )
+
+    output = out_dir / Path(selected).name
+    with archive.open(selected) as source, output.open("wb") as destination:
+        shutil.copyfileobj(source, destination)
+
+print(output)
+PY
+}
+
+port_is_open()
+{
+	(
+		exec 3<>"/dev/tcp/${HW_SERVER_HOST}/${HW_SERVER_PORT}"
+	) >/dev/null 2>&1
+}
+
+wait_for_hw_server()
+{
+	local attempts=200
+
+	for ((i = 0; i < attempts; i++)); do
+		port_is_open && return 0
+
+		if [[ "${HW_SERVER_STARTED_BY_SCRIPT}" == "1" ]] &&
+		   ! kill -0 "${HW_SERVER_PID}" 2>/dev/null; then
+			return 1
+		fi
+
+		sleep 0.1
+	done
+
+	return 1
+}
+
+start_hw_server_if_needed()
+{
+	local log_file="${TEMP_DIR}/hw_server.log"
+
+	if port_is_open; then
+		info "Using existing hw_server at ${HW_SERVER_URL}"
+		return
+	fi
+
+	if [[ "${HW_SERVER_HOST}" != "127.0.0.1" &&
+	      "${HW_SERVER_HOST}" != "localhost" ]]; then
+		error "cannot start a remote hw_server; start ${HW_SERVER_URL} manually"
+	fi
+
+	info "Starting hw_server at ${HW_SERVER_URL}"
+	hw_server -s "${HW_SERVER_URL}" >"${log_file}" 2>&1 &
+	HW_SERVER_PID=$!
+	HW_SERVER_STARTED_BY_SCRIPT=1
+
+	if ! wait_for_hw_server; then
+		[[ -f "${log_file}" ]] && cat "${log_file}" >&2
+		error "hw_server failed to start"
+	fi
+}
+
+create_replacement_bif()
+{
+	local base_pdi="$1"
+	local custom_plm="$2"
+	local output_bif="$3"
+
+	cat >"${output_bif}" <<EOF_BIF
+new_bif:
+{
+	image
+	{
+		partition
+		{
+			type = bootimage
+			file = "${base_pdi}"
+		}
+		partition
+		{
+			type = bootloader
+			file = "${custom_plm}"
+		}
+	}
+}
+EOF_BIF
+}
+
+program_pdi()
+{
+	local pdi="$1"
+	local tcl="${TEMP_DIR}/program-plm.tcl"
+
+	cat >"${tcl}" <<EOF_TCL
+connect -url {${HW_SERVER_URL}}
+puts "XSDB: available targets"
+targets
+puts "XSDB: selecting Versal device"
+targets -set -nocase -filter {name =~ "*Versal*"}
+puts "XSDB: programming custom PLM PDI"
+device program {${pdi}}
+puts "XSDB: programming complete"
+disconnect
+exit
+EOF_TCL
+
+	info "Programming PDI over JTAG"
+	xsdb "${tcl}" || error "XSDB failed while programming ${pdi}"
+}
+
+main()
+{
+	local workspace_arg=""
+
+	while (( $# > 0 )); do
+		case "$1" in
+			--xsa)
+				(( $# >= 2 )) || error "--xsa requires a path"
+				EXPLICIT_XSA="$2"
+				shift 2
+				;;
+			--keep-hw-server)
+				KEEP_HW_SERVER=1
+				shift
+				;;
+			-h|--help)
+				usage
+				exit 0
+				;;
+			-*)
+				error "unknown option: $1"
+				;;
+			*)
+				[[ -z "${workspace_arg}" ]] || error "only one workspace may be specified"
+				workspace_arg="$1"
+				shift
+				;;
+		esac
+	done
+
+	[[ -n "${workspace_arg}" ]] || { usage >&2; exit 2; }
+
+	require_command realpath
+	require_command find
+	require_command python3
+	require_command bootgen
+	require_command xsdb
+	require_command hw_server
+
+	TEMP_DIR="$(mktemp -d)"
+
+	local workspace
+	local xsa
+	local custom_plm
+	local base_pdi
+	local custom_bif
+	local output_pdi
+
+	workspace="$(resolve_workspace "${workspace_arg}")"
+	xsa="$(resolve_xsa "${workspace}")"
+	custom_plm="${workspace}/plm/build/plm.elf"
+	custom_bif="${workspace}/PLM_CUSTOM_JTAG.bif"
+	output_pdi="${workspace}/PLM_CUSTOM_JTAG.pdi"
+
+	[[ -s "${custom_plm}" ]] || error "custom PLM ELF not found or empty: ${custom_plm}"
+
+	base_pdi="$(extract_base_pdi_from_xsa "${xsa}" "${TEMP_DIR}/xsa")"
+	[[ -s "${base_pdi}" ]] || error "failed to extract the base PDI from ${xsa}"
+
+	info "Workspace: ${workspace}"
+	info "XSA: ${xsa}"
+	info "Base PDI from XSA: ${base_pdi}"
+	info "Custom PLM: ${custom_plm}"
+	info "Replacement BIF: ${custom_bif}"
+	info "Output PDI: ${output_pdi}"
+	printf '\n'
+
+	create_replacement_bif "${base_pdi}" "${custom_plm}" "${custom_bif}"
+	rm -f -- "${output_pdi}"
+
+	bootgen \
+		-arch versal \
+		-image "${custom_bif}" \
+		-w \
+		-o "${output_pdi}"
+
+	[[ -s "${output_pdi}" ]] || error "Bootgen did not create ${output_pdi}"
+
+	printf '\n'
+	start_hw_server_if_needed
+	program_pdi "${output_pdi}"
+
+	printf '\n'
+	info "Custom PLM deployed successfully"
+}
+
+main "$@"

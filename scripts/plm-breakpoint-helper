@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+usage() {
+	cat <<'EOF'
+Usage:
+  plm-breakpoint-helper <plm.elf> [symbol ...]
+
+Examples:
+  plm-breakpoint-helper plm/build/plm/build/plm.elf
+  plm-breakpoint-helper plm/build/plm/build/plm.elf XPlm_ModuleInit XPlm_HelloSpamModuleInit
+
+This helper prints candidate breakpoint symbols, their addresses, and source
+locations when debug info is present.
+EOF
+}
+
+infer_repo_root() {
+	local elf_path="$1"
+	local workspace_dir
+
+	workspace_dir="$(dirname -- "$(dirname -- "$(dirname -- "$(realpath -- "$elf_path")")")")"
+	realpath -- "$(dirname -- "$(dirname -- "${workspace_dir}")")"
+}
+
+[[ $# -ge 1 ]] || { usage >&2; exit 2; }
+
+elf="$1"
+shift || true
+
+[[ -f "$elf" ]] || { echo "ELF not found: $elf" >&2; exit 1; }
+
+if ! command -v nm >/dev/null 2>&1; then
+	echo "nm not found in PATH" >&2
+	exit 1
+fi
+
+if ! command -v addr2line >/dev/null 2>&1; then
+	echo "addr2line not found in PATH" >&2
+	exit 1
+fi
+
+	if [[ $# -eq 0 ]]; then
+		set -- \
+			XPlm_ModuleInit \
+			XPlm_HelloSpamModuleInit \
+			XPlmi_ModuleRegister \
+			XPlmi_Init \
+			XPlm_PmInit \
+		XPlmi_SsitEventsInit \
+		XLoader_Init \
+		XSecure_Init
+fi
+
+echo "ELF: $elf"
+echo
+
+for symbol in "$@"; do
+	line="$(nm -n "$elf" | awk -v sym="$symbol" '$3 == sym { print $1, $2, $3; exit }')"
+	if [[ -z "$line" ]]; then
+		echo "[MISS] $symbol"
+		continue
+	fi
+
+	addr="$(awk '{print $1}' <<<"$line")"
+	type="$(awk '{print $2}' <<<"$line")"
+	name="$(awk '{print $3}' <<<"$line")"
+	location="$(addr2line -f -e "$elf" "0x$addr" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+$//')"
+
+	echo "[HIT] $name"
+	echo "  addr: 0x$addr"
+	echo "  type: $type"
+	echo "  loc : ${location:-<no debug info>}"
+	echo "  xsdb: bpadd -addr &${name}"
+	echo
+done
+
+repo_root="$(infer_repo_root "$elf")"
+module_source="${repo_root}/plm/build/plm/src/common/xplm_module.c"
+custom_source="${repo_root}/plm/src/common/xplm_hello_spam_module.c"
+
+echo "Source-based breakpoint hints:"
+
+if [[ -f "$module_source" ]]; then
+	call_line="$(rg -n "Status = .*ModuleInit\\(" "$module_source" | tail -n 1 || true)"
+	if [[ -n "$call_line" ]]; then
+		line_no="${call_line%%:*}"
+		line_text="${call_line#*:}"
+		echo "  PLM dispatcher call site:"
+		echo "    file: $module_source"
+		echo "    line: $line_no"
+		echo "    text: $line_text"
+		echo "    xsdb: bpadd -file \"$module_source\" -line $line_no"
+		echo
+	fi
+fi
+
+if [[ -f "$custom_source" ]]; then
+	init_line="$(rg -n "^int XPlm_HelloSpamModuleInit\\(" "$custom_source" | tail -n 1 || true)"
+	if [[ -n "$init_line" ]]; then
+		line_no="${init_line%%:*}"
+		line_text="${init_line#*:}"
+		echo "  Custom module entry point:"
+		echo "    file: $custom_source"
+		echo "    line: $line_no"
+		echo "    text: $line_text"
+		echo "    xsdb: bpadd -file \"$custom_source\" -line $line_no"
+		echo
+	fi
+fi
+
+echo "Suggested early-break flow:"
+echo "  1. Select the PLM target in XSDB."
+echo "  2. Set a breakpoint on XPlm_ModuleInit or XPlm_HelloSpamModuleInit."
+echo "  3. con"

@@ -1,0 +1,29 @@
+.Xil/
+.agents/
+.codex/
+
+# Vitis generated workspaces and launch/build output.
+plm/build/
+build/
+_ide/
+*.log
+*.jou
+*.str
+*.pdi
+*.bif
+*.xsa
+BOOT.BIN
+output.bif
+rpu_app_jtag.tcl
+plm.log
+
+# Local helper not published with this lab repo.
+scripts/create-vitis-project.py
+
+# Rust build output.
+plm/rpu-app/target/
+
+# Python/editor caches.
+__pycache__/
+*.py[cod]
+.vscode/
