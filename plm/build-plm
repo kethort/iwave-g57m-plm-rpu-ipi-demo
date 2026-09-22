@@ -1,0 +1,2871 @@
+#!/usr/bin/env python3
+"""
+Create or reuse a Vitis Unified Versal PLM workspace, overlay custom sources,
+build plm.elf, optionally build an RPU application, and generate the launch PDI.
+
+Examples
+--------
+
+First run:
+
+    vitis -s build-plm.py \
+        ../plm_vitis_project \
+        --xsa ../system.xsa \
+        --custom-source-dir ../example-user-module/src \
+        --symlink-sources
+
+Subsequent runs using the existing platform and PLM component:
+
+    vitis -s build-plm.py \
+        ../plm_vitis_project \
+        --custom-source-dir ../example-user-module/src \
+        --symlink-sources
+
+Force complete regeneration:
+
+    vitis -s build-plm.py \
+        ../plm_vitis_project \
+        --xsa ../system.xsa \
+        --custom-source-dir ../example-user-module/src \
+        --symlink-sources \
+        --force-regenerate
+
+Build the PLM IPI user module and its R5-0 peer application:
+
+    vitis -s build-plm.py \
+        ../plm_vitis_project \
+        --xsa ../system.xsa \
+        --custom-source-dir ./src \
+        --register-module \
+            xplm_ipi_ping_pong_module.h:XPlm_IpiPingPongModuleInit \
+        --user-modules-count 1 \
+        --rpu-source ./rpu-app \
+        --symlink-sources \
+        --force-regenerate \
+        --launch-vitis
+
+By default, the Vitis debug PDI contains only the custom PLM. The PLM launch
+configuration programs that PDI and uses the PLM ELF for symbols only. The
+RPU application is built as a separate Vitis component and is not loaded by
+the PLM launch.
+
+Pass --embed-rpu-in-pdi to additionally generate a production-style combined
+PDI that boots both the PLM and RPU without the debugger. The combined PDI is
+kept separate from the PLM-only PDI used by the Vitis debug launch.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+from typing import Iterable, Optional
+
+
+PLATFORM_NAME = "platform"
+APPLICATION_NAME = "plm"
+PROCESSOR_NAME = "psv_pmc_0"
+DOMAIN_NAME = "standalone_psv_pmc_0"
+APPLICATION_TEMPLATE = "versal_plm"
+
+RPU_PLATFORM_NAME_DEFAULT = "rpu_platform"
+RPU_APPLICATION_NAME_DEFAULT = "rpu_ipi_ping_pong"
+RPU_PROCESSOR_NAME_DEFAULT = "psv_cortexr5_0"
+RPU_DOMAIN_NAME_DEFAULT = "standalone_psv_cortexr5_0"
+RPU_APPLICATION_TEMPLATE_DEFAULT = "empty_application"
+
+VERSAL_OVERRIDE_FILES = {
+    "xplm_hooks.c",
+    "xplm_hooks.h",
+    "xplm_plat.c",
+    "xplm_plat.h",
+    "xplm_ssitcomm.c",
+    "xplm_ssitcomm.h",
+}
+
+
+def info(message: str) -> None:
+    print(f"[INFO] {message}", flush=True)
+
+
+def debug(message: str) -> None:
+    print(f"[DEBUG] {message}", flush=True)
+
+
+def success(message: str) -> None:
+    print(f"[SUCCESS] {message}", flush=True)
+
+
+def fail(message: str) -> None:
+    raise RuntimeError(message)
+
+
+def absolute_path(value: str | Path) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def symlink_or_copy(
+    source: Path,
+    destination: Path,
+    use_symlink: bool,
+) -> None:
+    source_absolute = source.expanduser().absolute()
+    destination_absolute = destination.expanduser().absolute()
+
+    if source_absolute == destination_absolute:
+        info(
+            "Source and destination are identical; leaving file unchanged: "
+            f"{source_absolute}"
+        )
+        return
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    if destination.exists() or destination.is_symlink():
+        remove_path(destination)
+
+    if use_symlink:
+        destination.symlink_to(source_absolute)
+        info(f"Symlinked {destination} -> {source_absolute}")
+    else:
+        shutil.copy2(source_absolute, destination)
+        info(f"Copied {source_absolute} -> {destination}")
+
+
+def locate_vitis_launcher() -> Optional[Path]:
+    executable = shutil.which("vitis")
+    if executable:
+        return Path(executable).resolve()
+
+    vitis_root = os.environ.get("XILINX_VITIS")
+    if vitis_root:
+        candidate = Path(vitis_root) / "bin" / "vitis"
+        if candidate.is_file():
+            return candidate.resolve()
+
+    return None
+
+
+
+def require_host_tool(name: str) -> Path:
+    executable = shutil.which(name)
+    if executable is None:
+        fail(
+            f"Required tool '{name}' was not found in PATH. "
+            "Source the matching Vitis settings64.sh first."
+        )
+    return Path(executable).resolve()
+
+
+def extract_base_pdi_from_xsa(xsa: Path, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        archive = zipfile.ZipFile(xsa)
+    except zipfile.BadZipFile as error:
+        fail(f"XSA is not a readable ZIP archive: {xsa}: {error}")
+
+    with archive:
+        members = [
+            name
+            for name in archive.namelist()
+            if name.lower().endswith(".pdi")
+        ]
+
+        if not members:
+            fail(
+                "No PDI was found inside the XSA. Export the Versal XSA "
+                "with the device image included."
+            )
+
+        preferred_names = {
+            "system.pdi",
+            "design.pdi",
+            f"{xsa.stem.lower()}.pdi",
+        }
+        preferred = [
+            name
+            for name in members
+            if Path(name).name.lower() in preferred_names
+        ]
+
+        if len(preferred) == 1:
+            selected = preferred[0]
+        elif len(members) == 1:
+            selected = members[0]
+        else:
+            listing = "\n".join(f"  {name}" for name in members)
+            fail(
+                "Multiple PDI files were found inside the XSA and no "
+                f"unique base PDI could be selected:\n{listing}"
+            )
+
+        output = output_dir / Path(selected).name
+        with archive.open(selected) as source, output.open("wb") as destination:
+            shutil.copyfileobj(source, destination)
+
+    if not output.is_file() or output.stat().st_size == 0:
+        fail(f"Failed to extract a valid base PDI from XSA: {xsa}")
+
+    info(f"Extracted base PDI from XSA: {output}")
+    return output
+
+
+def verify_rpu_in_pdi(
+    *,
+    pdi: Path,
+    expected_core: str,
+    expected_image_name: str = "rpu_ipi_ping_pong",
+) -> None:
+    bootgen = require_host_tool("bootgen")
+
+    command = [
+        str(bootgen),
+        "-arch",
+        "versal",
+        "-read",
+        str(pdi),
+    ]
+
+    info("Verifying generated PDI: " + " ".join(command))
+
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    output = result.stdout + result.stderr
+
+    if result.returncode != 0:
+        fail(
+            "bootgen failed while inspecting the generated PDI:\n"
+            + output
+        )
+
+    readback_file = pdi.with_suffix(".read.txt")
+    readback_file.write_text(
+        output,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    normalized = output.lower()
+    expected_core_text = f"core: {expected_core}".lower()
+    expected_image_prefix = expected_image_name[:16].lower()
+
+    if expected_image_prefix not in normalized:
+        fail(
+            "Generated PDI does not contain the expected RPU image "
+            f"'{expected_image_name}'. Inspect: {readback_file}"
+        )
+
+    if expected_core_text not in normalized:
+        fail(
+            "Generated PDI does not contain the expected RPU core "
+            f"'{expected_core}'. Inspect: {readback_file}"
+        )
+
+    success(
+        "Verified RPU image in generated PDI: "
+        f"{expected_image_name} ({expected_core})"
+    )
+
+def generate_custom_plm_pdi(
+    *,
+    workspace: Path,
+    xsa: Path,
+    plm_elf: Path,
+    rpu_elf: Optional[Path] = None,
+    rpu_core: str = "r5-0",
+    install_for_vitis: bool = True,
+    output_stem: Optional[str] = None,
+) -> Path:
+    """Generate a replacement PDI containing the custom PLM and optional RPU ELF.
+
+    When install_for_vitis is true, copy the generated PDI to the PLM launch
+    resource path expected by Vitis. Production combined PDIs use
+    install_for_vitis=false so they cannot accidentally replace the PLM-only
+    debug PDI.
+    """
+    bootgen = require_host_tool("bootgen")
+
+    if output_stem is None:
+        output_stem = (
+            "PLM_RPU_PRODUCTION" if rpu_elf is not None else "PLM_CUSTOM_JTAG"
+        )
+    output_bif = workspace / f"{output_stem}.bif"
+    output_pdi = workspace / f"{output_stem}.pdi"
+    resource_dir = workspace / APPLICATION_NAME / "_ide" / "bootimage" / "resources"
+    resource_dir.mkdir(parents=True, exist_ok=True)
+
+    # Vitis-generated launch configurations normally expect the XSA basename.
+    vitis_pdi = resource_dir / f"{xsa.stem}.pdi"
+    temporary_dir = workspace / ".build-plm-pdi"
+
+    if temporary_dir.exists() or temporary_dir.is_symlink():
+        remove_path(temporary_dir)
+    temporary_dir.mkdir(parents=True)
+
+    try:
+        base_pdi = extract_base_pdi_from_xsa(xsa, temporary_dir)
+
+        # Match the previously validated BIF structure:
+        #
+        # - Explicitly identify the PMC subsystem image.
+        # - Replace its PLM bootloader.
+        # - Import the remaining base PDI contents.
+        # - Add the RPU application as def_subsystem with image ID 0x1C000000.
+        lines = [
+            "new_bif:",
+            "{",
+            "\timage",
+            "\t{",
+            "\t\tname = pmc_subsys",
+            "\t\tid = 0x1C000001",
+            "",
+            "\t\tpartition",
+            "\t\t{",
+            "\t\t\ttype = bootloader",
+            f'\t\t\tfile = "{plm_elf}"',
+            "\t\t}",
+            "",
+            "\t\tpartition",
+            "\t\t{",
+            "\t\t\ttype = bootimage",
+            f'\t\t\tfile = "{base_pdi}"',
+            "\t\t}",
+            "\t}",
+        ]
+
+        if rpu_elf is not None:
+            if not rpu_elf.is_file():
+                fail(f"RPU ELF not found: {rpu_elf}")
+
+            lines.extend(
+                [
+                    "",
+                    "\timage",
+                    "\t{",
+                    "\t\tname = def_subsystem",
+                    "\t\tid = 0x1C000000",
+                    "",
+                    "\t\tpartition",
+                    "\t\t{",
+                    f"\t\t\tcore = {rpu_core}",
+                    f'\t\t\tfile = "{rpu_elf}"',
+                    "\t\t}",
+                    "\t}",
+                ]
+            )
+
+        lines.extend(["}", ""])
+        output_bif.write_text("\n".join(lines), encoding="utf-8")
+        info(f"Generated BIF: {output_bif}")
+
+        stale_paths = [output_pdi]
+        if install_for_vitis:
+            stale_paths.append(vitis_pdi)
+        for stale in stale_paths:
+            if stale.exists() or stale.is_symlink():
+                remove_path(stale)
+
+        command = [
+            str(bootgen),
+            "-arch",
+            "versal",
+            "-image",
+            str(output_bif),
+            "-w",
+            "-o",
+            str(output_pdi),
+        ]
+
+        info("Generating custom PDI: " + " ".join(command))
+        subprocess.run(
+            command,
+            cwd=str(workspace),
+            check=True,
+        )
+
+        if not output_pdi.is_file() or output_pdi.stat().st_size == 0:
+            fail(f"bootgen did not create a valid PDI: {output_pdi}")
+
+        if rpu_elf is not None:
+            verify_rpu_in_pdi(
+                pdi=output_pdi,
+                expected_core=rpu_core,
+                expected_image_name="def_subsystem",
+            )
+
+        if install_for_vitis:
+            shutil.copy2(output_pdi, vitis_pdi)
+
+    finally:
+        if temporary_dir.exists() or temporary_dir.is_symlink():
+            remove_path(temporary_dir)
+
+    success(f"Custom PDI generated: {output_pdi}")
+    if install_for_vitis:
+        success(f"Vitis launch PDI installed: {vitis_pdi}")
+
+    if rpu_elf is not None:
+        success(
+            f"Combined PDI verified with RPU ELF: "
+            f"{rpu_elf} ({rpu_core})"
+        )
+
+    return vitis_pdi if install_for_vitis else output_pdi
+
+def resolve_exported_platform_named(workspace: Path, platform_name: str) -> Path:
+    expected = workspace / platform_name / "export" / platform_name / "platform.xpfm"
+    if expected.is_file():
+        return expected.resolve()
+    discovered = sorted((workspace / platform_name).glob("export/**/*.xpfm"))
+    if discovered:
+        return discovered[0].resolve()
+    fail(f"Unable to locate exported platform beneath {workspace / platform_name / 'export'}")
+
+
+def create_rpu_platform(
+    client: object,
+    xsa: Path,
+    platform_name: str,
+    processor_name: str,
+    domain_name: str,
+) -> object:
+    info(f"Creating RPU platform component '{platform_name}'")
+    attempts = (
+        {
+            "name": platform_name,
+            "hw_design": str(xsa),
+            "os": "standalone",
+            "cpu": processor_name,
+            "domain_name": domain_name,
+        },
+        {
+            "name": platform_name,
+            "hw_design": str(xsa),
+            "os": "standalone",
+            "cpu": processor_name,
+        },
+    )
+    return call_first_supported(client, ("create_platform_component",), attempts)
+
+
+def create_rpu_application(
+    client: object,
+    exported_platform: Path,
+    app_name: str,
+    domain_name: str,
+    template_name: str,
+) -> object:
+    info(f"Creating RPU application component '{app_name}'")
+    attempts = (
+        {
+            "name": app_name,
+            "platform": str(exported_platform),
+            "domain": domain_name,
+            "template": template_name,
+        },
+        {
+            "name": app_name,
+            "platform": exported_platform.stem,
+            "domain": domain_name,
+            "template": template_name,
+        },
+    )
+    return call_first_supported(
+        client,
+        ("create_app_component",),
+        attempts,
+    )
+
+def overlay_rpu_sources(
+    source_dir: Path,
+    app_source_root: Path,
+    use_symlinks: bool,
+) -> None:
+    """Overlay C, assembly, and header files into an RPU application."""
+
+    if not source_dir.is_dir():
+        fail(f"RPU source directory not found: {source_dir}")
+
+    supported = {".c", ".h", ".S", ".s"}
+
+    sources = [
+        path
+        for path in sorted(source_dir.rglob("*"))
+        if path.is_file() and path.suffix in supported
+    ]
+
+    if not sources:
+        fail(
+            "No C, header, or assembly files found in RPU source directory: "
+            f"{source_dir}"
+        )
+
+    app_source_root.mkdir(parents=True, exist_ok=True)
+
+    compile_entries: list[str] = []
+
+    for source in sources:
+        relative = source.relative_to(source_dir)
+        destination = app_source_root / relative
+
+        symlink_or_copy(
+            source,
+            destination,
+            use_symlink=use_symlinks,
+        )
+
+        if source.suffix in {".c", ".S", ".s"}:
+            compile_entries.append(relative.as_posix())
+
+    # A custom RPU linker script is optional. When one is not supplied,
+    # retain the linker script generated by the Vitis application template.
+    custom_linker = source_dir / "lscript.ld"
+
+    if custom_linker.is_file():
+        generated_linker = app_source_root / "lscript.ld"
+
+        symlink_or_copy(
+            custom_linker,
+            generated_linker,
+            use_symlink=False,
+        )
+
+        info(f"Installed custom RPU linker script: {custom_linker}")
+    else:
+        info(
+            "No custom RPU lscript.ld was provided; retaining the "
+            "Vitis-generated linker script"
+        )
+
+    user_config = app_source_root / "UserConfig.cmake"
+
+    if user_config.is_file():
+        update_user_compile_sources(
+            user_config,
+            compile_entries,
+        )
+    else:
+        info(
+            "RPU UserConfig.cmake was not present; relying on generated "
+            "application source discovery"
+        )
+
+def overlay_rust_rpu_sources(
+    cargo_root: Path,
+    app_source_root: Path,
+    package_name: str,
+    use_symlinks: bool,
+) -> None:
+    """Expose Rust sources in the Vitis component without copying Cargo output."""
+    entries = (
+        cargo_root / "Cargo.toml",
+        cargo_root / "Cargo.lock",
+        cargo_root / ".cargo",
+        cargo_root / "bsp_bindings",
+        cargo_root / package_name,
+    )
+    rust_root = app_source_root / "rust"
+    rust_root.mkdir(parents=True, exist_ok=True)
+
+    for source in entries:
+        if not source.exists():
+            continue
+        destination = rust_root / source.name
+        if destination.exists() or destination.is_symlink():
+            remove_path(destination)
+        if use_symlinks:
+            destination.symlink_to(source.resolve(), target_is_directory=source.is_dir())
+            info(f"Symlinked {destination} -> {source.resolve()}")
+        elif source.is_dir():
+            shutil.copytree(
+                source,
+                destination,
+                ignore=shutil.ignore_patterns("target"),
+            )
+            info(f"Copied {source} -> {destination}")
+        else:
+            shutil.copy2(source, destination)
+            info(f"Copied {source} -> {destination}")
+
+
+def derive_vitis_root() -> Path:
+    configured = os.environ.get("XILINX_VITIS")
+    if configured:
+        root = Path(configured).resolve()
+        if (root / "gnu" / "armr5").is_dir():
+            return root
+
+    launcher = locate_vitis_launcher()
+    if launcher is not None:
+        for parent in launcher.parents:
+            if (parent / "gnu" / "armr5").is_dir():
+                return parent
+
+    fail(
+        "Unable to locate the Vitis installation root. Source the matching "
+        "Vitis settings64.sh before building the Rust RPU firmware."
+    )
+
+
+def discover_arm_r5_gcc(vitis_root: Path) -> Path:
+    toolchain_root = vitis_root / "gnu" / "armr5" / "lin"
+    for name in (
+        "armr5-none-eabi-gcc",
+        "arm-none-eabi-gcc",
+        "armrm-xilinx-eabi-gcc",
+    ):
+        for candidate in sorted(toolchain_root.rglob(name)):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate.resolve()
+    fail(f"Unable to find the Vitis ARM-R5 GCC beneath {toolchain_root}")
+
+
+def gcc_query(gcc: Path, argument: str) -> str:
+    result = subprocess.run(
+        [str(gcc), argument],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def discover_arm_r5_environment(vitis_root: Path) -> dict[str, str]:
+    gcc = discover_arm_r5_gcc(vitis_root)
+    sysroot_text = gcc_query(gcc, "--print-sysroot")
+    sysroot = Path(sysroot_text).resolve() if sysroot_text else None
+    include_dirs: list[Path] = []
+
+    for query in ("include", "include-fixed"):
+        value = gcc_query(gcc, f"-print-file-name={query}")
+        candidate = Path(value)
+        if value != query and candidate.is_dir():
+            include_dirs.append(candidate.resolve())
+
+    if sysroot is not None:
+        for relative in (Path("usr/include"), Path("include")):
+            candidate = sysroot / relative
+            if candidate.is_dir():
+                include_dirs.append(candidate.resolve())
+
+    toolchain_root = vitis_root / "gnu" / "armr5" / "lin"
+    for header in sorted(toolchain_root.glob("*/usr/include/ctype.h")):
+        include_dirs.append(header.parent.resolve())
+
+    unique_dirs = list(dict.fromkeys(include_dirs))
+    if not unique_dirs:
+        fail(f"No ARM-R5 C include directories were discovered using {gcc}")
+
+    return {
+        "ARM_R5_GCC": str(gcc),
+        "ARM_R5_GCC_BIN": str(gcc.parent),
+        "ARM_R5_SYSROOT": str(sysroot) if sysroot is not None else "",
+        "ARM_R5_INCLUDE_DIRS": os.pathsep.join(map(str, unique_dirs)),
+    }
+
+
+def discover_bsp_include_dir(
+    workspace: Path,
+    platform_name: str,
+    domain_name: str,
+) -> Path:
+    preferred = (
+        workspace
+        / platform_name
+        / "export"
+        / platform_name
+        / "sw"
+        / domain_name
+        / "include"
+    )
+    if (preferred / "xipipsu.h").is_file():
+        return preferred.resolve()
+
+    candidates = sorted(
+        header.parent.resolve()
+        for header in (workspace / platform_name).rglob("xipipsu.h")
+        if (header.parent / "xparameters.h").is_file()
+    )
+    if len(candidates) == 1:
+        return candidates[0]
+    fail(
+        "Unable to uniquely locate the generated RPU BSP include directory "
+        f"beneath {workspace / platform_name}"
+    )
+
+
+def build_rust_rpu_application(
+    cargo_root: Path,
+    workspace: Path,
+    platform_name: str,
+    domain_name: str,
+    package_name: str,
+    target_name: str,
+    linker_script: Path,
+    release: bool,
+    features: tuple[str, ...] = (),
+) -> Path:
+    cargo_executable = shutil.which("cargo")
+    if cargo_executable is None:
+        fail(
+            "Cargo was not found in PATH. Install Rust and the "
+            f"{target_name} target before building the Rust RPU firmware."
+        )
+    # ~/.cargo/bin/cargo is commonly a rustup shim. Do not resolve the
+    # symlink or the child process would invoke rustup as if it were Cargo.
+    cargo = Path(cargo_executable).absolute()
+    bsp_include = discover_bsp_include_dir(
+        workspace,
+        platform_name,
+        domain_name,
+    )
+    toolchain_env = discover_arm_r5_environment(derive_vitis_root())
+    env = os.environ.copy()
+    env.update(toolchain_env)
+    env["BSP_INCLUDE_DIR"] = str(bsp_include)
+    env["RPU_LINKER_SCRIPT"] = str(linker_script.resolve())
+    env["PATH"] = (
+        toolchain_env["ARM_R5_GCC_BIN"]
+        + os.pathsep
+        + env.get("PATH", "")
+    )
+
+    command = [
+        str(cargo),
+        "build",
+        "--manifest-path",
+        str(cargo_root / "Cargo.toml"),
+        "--package",
+        package_name,
+        "--target",
+        target_name,
+        "--locked",
+    ]
+    if features:
+        command.extend(["--features", ",".join(features)])
+    if release:
+        command.append("--release")
+
+    info(
+        f"Building Rust RPU package '{package_name}' for {target_name} "
+        f"using BSP {bsp_include}"
+    )
+    subprocess.run(command, cwd=cargo_root, env=env, check=True)
+
+    profile = "release" if release else "debug"
+    elf = cargo_root / "target" / target_name / profile / package_name
+    if not elf.is_file():
+        fail(f"Cargo completed, but the RPU ELF was not found: {elf}")
+    return elf.resolve()
+
+
+def resolve_rpu_component_dir(
+    rpu_elf: Path,
+    explicit_component_dir: Optional[Path] = None,
+) -> Path:
+    """Resolve the Vitis application-component directory that owns an RPU ELF."""
+    component_dir = (
+        explicit_component_dir.resolve()
+        if explicit_component_dir is not None
+        else rpu_elf.parent.parent.resolve()
+    )
+
+    metadata = component_dir / "vitis-comp.json"
+    if not metadata.is_file():
+        fail(
+            "Unable to expose the existing RPU application in Vitis because "
+            f"component metadata was not found at {metadata}. "
+            "Pass --rpu-component-dir with the directory containing "
+            "vitis-comp.json, or use --rpu-source to create the component."
+        )
+
+    try:
+        rpu_elf.resolve().relative_to(component_dir)
+    except ValueError:
+        fail(
+            f"RPU ELF {rpu_elf} is not contained beneath the selected "
+            f"RPU component directory {component_dir}"
+        )
+
+    return component_dir
+
+
+def expose_existing_rpu_component(
+    *,
+    workspace: Path,
+    component_dir: Path,
+    app_name: str,
+) -> Path:
+    """Symlink an existing RPU application component into the PLM workspace."""
+    destination = workspace / app_name
+    source = component_dir.resolve()
+
+    if destination.is_symlink():
+        current = destination.resolve(strict=False)
+        if current == source:
+            info(f"RPU application component already exposed: {destination} -> {source}")
+            return destination
+        remove_path(destination)
+    elif destination.exists():
+        if destination.resolve() == source:
+            info(f"RPU application component already present in workspace: {destination}")
+            return destination
+        fail(
+            f"Cannot expose RPU component '{app_name}' because the workspace path "
+            f"already exists and points elsewhere: {destination}"
+        )
+
+    destination.symlink_to(source, target_is_directory=True)
+    success(f"RPU application component exposed in Vitis workspace: {destination} -> {source}")
+    return destination
+
+def launch_vitis_gui(workspace: Path) -> None:
+    launcher = locate_vitis_launcher()
+    if launcher is None:
+        fail(
+            "Unable to locate the Vitis launcher. Source the matching "
+            "Vitis settings64.sh before using --launch-vitis."
+        )
+
+    command = [str(launcher), "-w", str(workspace)]
+    info("Launching Vitis GUI: " + " ".join(command))
+
+    # Launch Vitis with the inherited environment only. In particular, do not
+    # inject IDE_DEBUG_FILTER_* variables; target selection is left to the
+    # launch configuration and Vitis hardware target discovery.
+    subprocess.Popen(
+        command,
+        cwd=str(workspace),
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def normalized_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", key.lower())
+
+
+def tree_contains_text(node: object, needles: Iterable[str]) -> bool:
+    normalized_needles = tuple(value.lower() for value in needles if value)
+    if not normalized_needles:
+        return False
+
+    if isinstance(node, dict):
+        return any(
+            tree_contains_text(key, normalized_needles)
+            or tree_contains_text(value, normalized_needles)
+            for key, value in node.items()
+        )
+
+    if isinstance(node, list):
+        return any(tree_contains_text(item, normalized_needles) for item in node)
+
+    if isinstance(node, str):
+        lowered = node.lower()
+        return any(needle in lowered for needle in normalized_needles)
+
+    return False
+
+
+def patch_launch_tree(
+    node: object,
+    *,
+    attach_to_running: bool,
+    pdi_workspace_path: Optional[str] = None,
+    path: str = "root",
+) -> tuple[object, int]:
+    if attach_to_running:
+        replacements = {
+            "targetsetupmode": "Attach to Running Target",
+            "setuptype": "Attach to Running Target",
+        }
+        true_keys: set[str] = set()
+        false_keys = {
+            "enablecrosstriggering",
+            "resetentiresystem",
+            "resetsystem",
+            "systemreset",
+            "resetprocessor",
+            "programdevice",
+            "stopatentry",
+            "stopatmain",
+            "downloadapplication",
+            "runafterdownload",
+        }
+    else:
+        # Match the previously validated PLM debug flow: program the generated
+        # PDI and halt the MicroBlaze PPU at the PLM ELF entry point. Do not
+        # force application download because the PLM executable is loaded by
+        # the PDI; the ELF is used by Vitis for symbols and source mapping.
+        replacements = {}
+        true_keys = {
+            "programdevice",
+            "stopatentry",
+        }
+        false_keys = {
+            "stopatmain",
+        }
+
+    changes = 0
+
+    if isinstance(node, dict):
+        result: dict[str, object] = {}
+
+        for key, value in node.items():
+            normalized = normalized_key(key)
+            current_path = f"{path}.{key}"
+
+            # Only non-attach launches need a PDI path. An RPU attach launch must
+            # not program the device because the combined PDI already started R5-0.
+            if (
+                not attach_to_running
+                and normalized == "pdifile"
+                and pdi_workspace_path is not None
+            ):
+                if value != pdi_workspace_path:
+                    info(
+                        f"Changing {current_path}: "
+                        f"{value!r} -> {pdi_workspace_path!r}"
+                    )
+                    value = pdi_workspace_path
+                    changes += 1
+            elif normalized in replacements:
+                replacement = replacements[normalized]
+                if value != replacement:
+                    info(
+                        f"Changing {current_path}: "
+                        f"{value!r} -> {replacement!r}"
+                    )
+                    value = replacement
+                    changes += 1
+            elif normalized in true_keys:
+                if value is not True:
+                    info(f"Changing {current_path}: {value!r} -> True")
+                    value = True
+                    changes += 1
+            elif normalized in false_keys:
+                if value is not False:
+                    info(f"Changing {current_path}: {value!r} -> False")
+                    value = False
+                    changes += 1
+
+            value, nested_changes = patch_launch_tree(
+                value,
+                attach_to_running=attach_to_running,
+                pdi_workspace_path=pdi_workspace_path,
+                path=current_path,
+            )
+            changes += nested_changes
+            result[key] = value
+
+        normalized_keys = {normalized_key(key) for key in result}
+        is_launch_config = (
+            "launchconfigname" in normalized_keys
+            or "debugtype" in normalized_keys
+            or (
+                "request" in normalized_keys
+                and "type" in normalized_keys
+                and "name" in normalized_keys
+            )
+        )
+
+        if is_launch_config:
+            if attach_to_running:
+                required_values = {
+                    "targetSetupMode": "Attach to Running Target",
+                    "resetEntireSystem": False,
+                    "resetProcessor": False,
+                    "programDevice": False,
+                    "downloadApplication": False,
+                    "stopAtEntry": False,
+                    "stopAtMain": False,
+                    "runAfterDownload": False,
+                    "enableCrossTriggering": False,
+                }
+            else:
+                required_values = {
+                    "programDevice": True,
+                    "stopAtEntry": True,
+                    "stopAtMain": False,
+                }
+
+            for key, required_value in required_values.items():
+                normalized = normalized_key(key)
+                matching_key = next(
+                    (
+                        existing_key
+                        for existing_key in result
+                        if normalized_key(existing_key) == normalized
+                    ),
+                    None,
+                )
+
+                if matching_key is None:
+                    info(f"Adding {path}.{key}: {required_value!r}")
+                    result[key] = required_value
+                    changes += 1
+                elif result[matching_key] != required_value:
+                    info(
+                        f"Changing {path}.{matching_key}: "
+                        f"{result[matching_key]!r} -> {required_value!r}"
+                    )
+                    result[matching_key] = required_value
+                    changes += 1
+
+            if attach_to_running:
+                attach_key = next(
+                    (
+                        key
+                        for key in result
+                        if normalized_key(key) == "attachtorunningtargetoptions"
+                    ),
+                    None,
+                )
+                if attach_key is None:
+                    attach_key = "attachToRunningTargetOptions"
+                    result[attach_key] = {}
+                    changes += 1
+
+                attach_options = result[attach_key]
+            else:
+                attach_options = None
+
+            if isinstance(attach_options, dict):
+                attach_defaults = {
+                    "targetSetupMode": "Attach to Running Target",
+                    "executeScript": False,
+                    "scriptPath": "",
+                    "resetProcessor": False,
+                    "downloadApplication": False,
+                    "stopAtEntry": False,
+                }
+                for key, required_value in attach_defaults.items():
+                    matching_key = next(
+                        (
+                            existing_key
+                            for existing_key in attach_options
+                            if normalized_key(existing_key) == normalized_key(key)
+                        ),
+                        None,
+                    )
+                    if matching_key is None:
+                        info(
+                            f"Adding {path}.{attach_key}.{key}: "
+                            f"{required_value!r}"
+                        )
+                        attach_options[key] = required_value
+                        changes += 1
+                    elif attach_options[matching_key] != required_value:
+                        info(
+                            f"Changing {path}.{attach_key}.{matching_key}: "
+                            f"{attach_options[matching_key]!r} -> "
+                            f"{required_value!r}"
+                        )
+                        attach_options[matching_key] = required_value
+                        changes += 1
+
+        return result, changes
+
+    if isinstance(node, list):
+        result_list: list[object] = []
+        for index, item in enumerate(node):
+            patched_item, nested_changes = patch_launch_tree(
+                item,
+                attach_to_running=attach_to_running,
+                pdi_workspace_path=pdi_workspace_path,
+                path=f"{path}[{index}]",
+            )
+            changes += nested_changes
+            result_list.append(patched_item)
+        return result_list, changes
+
+    return node, changes
+
+
+def remove_plm_attach_configuration(data: object) -> tuple[object, int]:
+    """Remove the obsolete PLM attach-only configuration, if present."""
+    if not isinstance(data, dict):
+        return data, 0
+
+    configurations = data.get("configurations")
+    if not isinstance(configurations, list):
+        return data, 0
+
+    original_count = len(configurations)
+    configurations[:] = [
+        item
+        for item in configurations
+        if not (
+            isinstance(item, dict)
+            and item.get("name") == "plm_attach_running"
+        )
+    ]
+    removed = original_count - len(configurations)
+    if removed:
+        info("Removed obsolete PLM attach-to-running configuration")
+    return data, removed
+
+
+
+def patch_launch_configs(
+    workspace: Path,
+    vitis_pdi: Optional[Path] = None,
+    rpu_application_dir: Optional[Path] = None,
+    rpu_app_name: Optional[str] = None,
+    rpu_processor: Optional[str] = None,
+    rpu_elf: Optional[Path] = None,
+) -> None:
+    launch_files = [
+        path
+        for path in workspace.rglob("launch.json")
+        if ".git" not in path.parts
+    ]
+
+    if not launch_files:
+        info("No launch.json files found to patch")
+        return
+
+    pdi_workspace_path: Optional[str] = None
+    if vitis_pdi is not None:
+        relative_pdi = vitis_pdi.resolve().relative_to(workspace.resolve())
+        pdi_workspace_path = "${workspaceFolder}/" + relative_pdi.as_posix()
+
+    rpu_elf_workspace_path: Optional[str] = None
+    if rpu_elf is not None:
+        relative_rpu_elf = rpu_elf.resolve().relative_to(workspace.resolve())
+        rpu_elf_workspace_path = (
+            "${workspaceFolder}/" + relative_rpu_elf.as_posix()
+        )
+
+    for path in launch_files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            info(f"Skipping invalid launch.json {path}: {error}")
+            continue
+
+        path_is_rpu = False
+        if rpu_application_dir is not None:
+            try:
+                path.resolve(strict=False).relative_to(
+                    rpu_application_dir.resolve(strict=False)
+                )
+                path_is_rpu = True
+            except ValueError:
+                pass
+
+        # Classify by component path, not by launch contents. The RPU launch
+        # lives beneath the RPU application component; the PLM launch does not.
+        is_rpu_launch = path_is_rpu
+
+        patched, changes = patch_launch_tree(
+            data,
+            attach_to_running=is_rpu_launch,
+            pdi_workspace_path=pdi_workspace_path,
+        )
+
+        if not is_rpu_launch:
+            try:
+                path.resolve(strict=False).relative_to(
+                    (workspace / APPLICATION_NAME).resolve(strict=False)
+                )
+                patched, removed_changes = remove_plm_attach_configuration(
+                    patched
+                )
+                changes += removed_changes
+                if (
+                    rpu_processor is not None
+                    and rpu_app_name is not None
+                    and isinstance(patched, dict)
+                ):
+                    applications_key = next(
+                        (
+                            key
+                            for key in patched
+                            if normalized_key(key) == "applications"
+                        ),
+                        None,
+                    )
+                    if applications_key is not None:
+                        applications = patched[applications_key]
+                        if isinstance(applications, list):
+                            original_count = len(applications)
+
+                            def is_rpu_entry(entry: object) -> bool:
+                                if not isinstance(entry, dict):
+                                    return False
+                                processor = next(
+                                    (
+                                        value
+                                        for key, value in entry.items()
+                                        if normalized_key(key) == "processor"
+                                    ),
+                                    None,
+                                )
+                                if processor == rpu_processor:
+                                    return True
+                                values = [str(value).lower() for value in entry.values()]
+                                if any(
+                                    rpu_app_name.lower() in value
+                                    for value in values
+                                ):
+                                    return True
+                                if rpu_elf_workspace_path is not None:
+                                    return any(
+                                        rpu_elf_workspace_path.lower() in value
+                                        for value in values
+                                    )
+                                return False
+
+                            applications[:] = [
+                                entry
+                                for entry in applications
+                                if not is_rpu_entry(entry)
+                            ]
+                            removed_rpu_rows = original_count - len(applications)
+                            if removed_rpu_rows:
+                                info(
+                                    "Removed stale RPU application row from "
+                                    f"PLM debug launch: {path}"
+                                )
+                                changes += removed_rpu_rows
+                            if not applications:
+                                del patched[applications_key]
+                                changes += 1
+            except ValueError:
+                pass
+
+        if changes == 0:
+            mode = "RPU attach" if is_rpu_launch else "PLM"
+            info(f"Launch config already has {mode} settings: {path}")
+            continue
+
+        path.write_text(
+            json.dumps(patched, indent=2, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+        )
+        if is_rpu_launch:
+            success(f"Configured RPU attach-to-running launch: {path}")
+        else:
+            info(f"Updated PLM launch config: {path}")
+
+
+def read_process_cmdline(pid: int) -> str:
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return ""
+
+    return raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+
+
+def read_process_parent(pid: int) -> Optional[int]:
+    try:
+        fields = (Path("/proc") / str(pid) / "stat").read_text().split()
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError):
+        return None
+
+    if len(fields) < 4:
+        return None
+
+    try:
+        return int(fields[3])
+    except ValueError:
+        return None
+
+
+def current_user_process_ids() -> set[int]:
+    process_ids: set[int] = set()
+    uid = os.getuid()
+
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+
+        try:
+            if entry.stat().st_uid == uid:
+                process_ids.add(int(entry.name))
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+
+    return process_ids
+
+
+def vitis_server_root_processes() -> set[int]:
+    roots: set[int] = set()
+
+    for pid in current_user_process_ids():
+        cmdline = read_process_cmdline(pid)
+        if not cmdline:
+            continue
+
+        if "/Vitis/bin/vitis-server" in cmdline:
+            roots.add(pid)
+
+    return roots
+
+
+def descendant_processes(root_pid: int) -> set[int]:
+    descendants: set[int] = set()
+    pending = [root_pid]
+    parent_map: dict[int, list[int]] = {}
+
+    for pid in current_user_process_ids():
+        parent = read_process_parent(pid)
+        if parent is not None:
+            parent_map.setdefault(parent, []).append(pid)
+
+    while pending:
+        parent = pending.pop()
+        for child in parent_map.get(parent, []):
+            if child not in descendants:
+                descendants.add(child)
+                pending.append(child)
+
+    return descendants
+
+
+def process_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+
+
+def path_is_within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.resolve(strict=False).relative_to(root.resolve(strict=False))
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def process_references_workspace(pid: int, workspace: Path) -> bool:
+    proc = Path("/proc") / str(pid)
+
+    try:
+        cwd = proc.joinpath("cwd").resolve(strict=False)
+        if path_is_within(cwd, workspace):
+            return True
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        pass
+
+    fd_dir = proc / "fd"
+    try:
+        entries = list(fd_dir.iterdir())
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return False
+
+    for entry in entries:
+        try:
+            target = entry.resolve(strict=False)
+        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            continue
+        if path_is_within(target, workspace):
+            return True
+
+    return False
+
+
+def workspace_owner_processes(workspace: Path) -> set[int]:
+    owners: set[int] = set()
+    own_pid = os.getpid()
+
+    for pid in current_user_process_ids():
+        if pid == own_pid:
+            continue
+
+        cmdline = read_process_cmdline(pid)
+        is_vitis_related = any(
+            marker in cmdline
+            for marker in (
+                "/Vitis/",
+                "vitis-server",
+                "rigel_server",
+                "com.xilinx.rigel",
+            )
+        )
+
+        if is_vitis_related and process_references_workspace(pid, workspace):
+            owners.add(pid)
+
+    return owners
+
+
+def describe_processes(process_ids: set[int]) -> str:
+    descriptions = []
+    for pid in sorted(process_ids):
+        cmdline = read_process_cmdline(pid)
+        descriptions.append(f"{pid}: {cmdline or '<unavailable>'}")
+    return "; ".join(descriptions)
+
+
+def terminate_processes(process_ids: set[int], description: str) -> None:
+    live = {pid for pid in process_ids if process_is_alive(pid)}
+    if not live:
+        return
+
+    info(
+        f"Stopping {description}: "
+        + ", ".join(str(pid) for pid in sorted(live))
+    )
+
+    for pid in sorted(live, reverse=True):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        remaining = {pid for pid in live if process_is_alive(pid)}
+        if not remaining:
+            return
+        time.sleep(0.1)
+
+    remaining = {pid for pid in live if process_is_alive(pid)}
+    if remaining:
+        info(
+            "Vitis server did not exit after SIGTERM; sending SIGKILL to: "
+            + ", ".join(str(pid) for pid in sorted(remaining))
+        )
+
+    for pid in sorted(remaining, reverse=True):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def terminate_vitis_server_roots(root_process_ids: set[int], description: str) -> None:
+    process_ids: set[int] = set()
+    for root_pid in root_process_ids:
+        process_ids.update(descendant_processes(root_pid))
+        process_ids.add(root_pid)
+
+    terminate_processes(process_ids, description)
+
+
+def close_vitis_client(client: object) -> None:
+    close_method = getattr(client, "close", None)
+    if close_method is None:
+        return
+
+    try:
+        close_method()
+    except Exception as error:
+        info(f"Vitis client close reported an error: {error}")
+
+
+def workspace_lock_candidates(workspace: Path) -> list[Path]:
+    """Return known Vitis/Eclipse workspace lock files, if present."""
+    candidates = [
+        workspace / ".metadata" / ".lock",
+        workspace / ".lock",
+        workspace / ".vitis" / ".lock",
+    ]
+    return [path for path in candidates if path.exists() or path.is_symlink()]
+
+
+def remove_stale_workspace_locks(workspace: Path) -> None:
+    """Remove only known Vitis workspace locks after all servers are gone."""
+    live_servers = vitis_server_root_processes()
+    if live_servers:
+        fail(
+            "Refusing to remove workspace locks while Vitis server processes "
+            "are still running: "
+            + ", ".join(str(pid) for pid in sorted(live_servers))
+        )
+
+    for lock_path in workspace_lock_candidates(workspace):
+        info(f"Removing stale workspace lock: {lock_path}")
+        remove_path(lock_path)
+
+
+def prepare_workspace_for_headless_build(workspace: Path) -> None:
+    """
+    Recover the workspace before create_client() starts its gRPC channel.
+
+    Killing and restarting a Vitis server after a client already exists can
+    leave Vitis Python background threads attached to a closed channel.
+    """
+    existing_servers = vitis_server_root_processes()
+    if existing_servers:
+        info(
+            "Found a pre-existing Vitis server; stopping it before creating "
+            "the build client"
+        )
+        terminate_vitis_server_roots(
+            existing_servers,
+            "pre-existing Vitis server",
+        )
+
+    owners = workspace_owner_processes(workspace)
+    if owners:
+        info(
+            "Found Vitis-related processes with the workspace open; "
+            "stopping them before creating the build client"
+        )
+        debug("Workspace owners: " + describe_processes(owners))
+        terminate_processes(owners, "Vitis workspace owner processes")
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not vitis_server_root_processes() and not workspace_owner_processes(workspace):
+            break
+        time.sleep(0.1)
+
+    remaining_servers = vitis_server_root_processes()
+    remaining_owners = workspace_owner_processes(workspace)
+    if remaining_servers or remaining_owners:
+        details = []
+        if remaining_servers:
+            details.append(
+                "server PIDs "
+                + ", ".join(str(pid) for pid in sorted(remaining_servers))
+            )
+        if remaining_owners:
+            details.append(
+                "workspace owners " + describe_processes(remaining_owners)
+            )
+        fail("Unable to release the Vitis workspace: " + "; ".join(details))
+
+    remove_stale_workspace_locks(workspace)
+
+
+def create_client_and_set_workspace(
+    vitis_module: object,
+    workspace: Path,
+) -> tuple[object, set[int]]:
+    """Create one client and set the workspace once, without in-process retry."""
+    preexisting_servers = vitis_server_root_processes()
+    client = vitis_module.create_client()
+    started_servers = vitis_server_root_processes() - preexisting_servers
+
+    try:
+        info("Setting Vitis workspace")
+        client.set_workspace(path=str(workspace))
+        return client, started_servers
+    except Exception as error:
+        close_vitis_client(client)
+        terminate_vitis_server_roots(
+            started_servers,
+            "Vitis server started by the failed client attempt",
+        )
+
+        locks = workspace_lock_candidates(workspace)
+        lock_text = ", ".join(str(path) for path in locks) if locks else "none"
+        owners = workspace_owner_processes(workspace)
+        owner_text = describe_processes(owners) if owners else "none"
+        raise RuntimeError(
+            f"Unable to set Vitis workspace: {error}. "
+            f"Known workspace locks remaining: {lock_text}. "
+            f"Vitis-related workspace owners remaining: {owner_text}"
+        ) from error
+
+
+def call_first_supported(
+    owner: object,
+    method_names: Iterable[str],
+    argument_sets: Iterable[object],
+) -> object:
+    """
+    Call the first available method/argument combination.
+
+    Vitis Unified Python API names have changed between releases, so this
+    helper tries the common variants without making workspace reuse depend
+    on one exact spelling.
+    """
+    last_error: Optional[Exception] = None
+    found_method = False
+
+    for method_name in method_names:
+        method = getattr(owner, method_name, None)
+        if method is None:
+            continue
+
+        found_method = True
+
+        for arguments in argument_sets:
+            try:
+                if isinstance(arguments, dict):
+                    return method(**arguments)
+                if isinstance(arguments, (tuple, list)):
+                    return method(*arguments)
+                return method(arguments)
+            except TypeError as error:
+                last_error = error
+                continue
+            except Exception:
+                raise
+
+    if not found_method:
+        raise AttributeError(
+            f"None of these methods exist: {', '.join(method_names)}"
+        )
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError("No supported Vitis API call succeeded")
+
+
+def get_existing_component(client: object, name: str, _kind: str) -> object:
+    """
+    Open an existing platform or application component from the workspace.
+    """
+    argument_sets = (
+        {"name": name},
+        (name,),
+    )
+
+    return call_first_supported(client, ("get_component",), argument_sets)
+
+
+def create_platform(client: object, xsa: Path) -> object:
+    info(f"Creating platform component '{PLATFORM_NAME}'")
+
+    attempts = (
+        {
+            "name": PLATFORM_NAME,
+            "hw_design": str(xsa),
+            "os": "standalone",
+            "cpu": PROCESSOR_NAME,
+        },
+    )
+
+    return call_first_supported(
+        client,
+        ("create_platform_component",),
+        attempts,
+    )
+
+
+def build_component(component: object, label: str) -> None:
+    info(f"Building {label}")
+    result = component.build()
+    debug(f"{label}.build() returned: {result!r}")
+
+    if result is None:
+        return
+
+    if isinstance(result, bool):
+        if not result:
+            fail(f"{label} build failed")
+        return
+
+    if isinstance(result, int):
+        if result != 0:
+            fail(f"{label} build failed with return code {result}")
+        return
+
+    if isinstance(result, str):
+        normalized = result.strip().lower()
+        if normalized in {"0", "success", "succeeded", "true"}:
+            return
+        fail(f"{label} build failed with result: {result}")
+
+    fail(
+        f"{label} returned an unsupported build result: "
+        f"{result!r} ({type(result).__name__})"
+    )
+
+
+def export_platform(platform: object) -> None:
+    export_method = getattr(platform, "export", None)
+
+    if export_method is None:
+        info("Platform has no export() method; using build output as-is")
+        return
+
+    info("Exporting platform")
+    result = export_method()
+    debug(f"platform.export() returned: {result}")
+
+
+def resolve_exported_platform(workspace: Path) -> Path:
+    expected = (
+        workspace
+        / PLATFORM_NAME
+        / "export"
+        / PLATFORM_NAME
+        / "platform.xpfm"
+    )
+
+    if expected.is_file():
+        return expected.resolve()
+
+    discovered = sorted(
+        (workspace / PLATFORM_NAME).glob("export/**/*.xpfm")
+    )
+
+    if discovered:
+        return discovered[0].resolve()
+
+    fail(
+        "Unable to locate an exported .xpfm beneath "
+        f"{workspace / PLATFORM_NAME / 'export'}"
+    )
+
+
+def add_platform_repository(client: object, exported_platform: Path) -> None:
+    repository = exported_platform.parent
+
+    attempts = (
+        {"platform": [str(repository)]},
+        ([str(repository)],),
+    )
+
+    try:
+        call_first_supported(
+            client,
+            ("add_platform_repos", "add_platform_repo"),
+            attempts,
+        )
+        info(f"Added platform repository: {repository}")
+    except Exception as error:
+        # Existing workspaces frequently already know this repository.
+        info(
+            "Platform repository was not added again; continuing with the "
+            f"existing workspace registration ({error})"
+        )
+
+
+def create_plm_application(
+    client: object,
+    exported_platform: Path,
+) -> object:
+    info(f"Creating PLM application component '{APPLICATION_NAME}'")
+
+    attempts = (
+        {
+            "name": APPLICATION_NAME,
+            "platform": str(exported_platform),
+            "domain": DOMAIN_NAME,
+            "template": APPLICATION_TEMPLATE,
+        },
+        {
+            "name": APPLICATION_NAME,
+            "platform": exported_platform.stem,
+            "domain": DOMAIN_NAME,
+            "template": APPLICATION_TEMPLATE,
+        },
+    )
+
+    return call_first_supported(
+        client,
+        ("create_app_component",),
+        attempts,
+    )
+
+
+def collect_custom_sources(source_dir: Path) -> list[Path]:
+    supported_suffixes = {".c", ".h", ".S", ".s"}
+
+    files = [
+        path
+        for path in sorted(source_dir.rglob("*"))
+        if path.is_file() and path.suffix in supported_suffixes
+    ]
+
+    if not files:
+        fail(
+            "No C, header, or assembly files were found in custom source "
+            f"directory: {source_dir}"
+        )
+
+    return files
+
+
+def destination_for_source(
+    source: Path,
+    custom_source_dir: Path,
+    plm_source_root: Path,
+) -> Path:
+    """
+    Map custom files into plm/src/common or plm/src/versal.
+
+    Explicit custom-source-dir/common and custom-source-dir/versal layouts
+    are honored. Otherwise known Versal platform files go to versal and all
+    other files go to common.
+    """
+    relative = source.relative_to(custom_source_dir)
+
+    if relative.parts and relative.parts[0] == "common":
+        return plm_source_root / "common" / Path(*relative.parts[1:])
+
+    if relative.parts and relative.parts[0] == "versal":
+        return plm_source_root / "versal" / Path(*relative.parts[1:])
+
+    if source.name in VERSAL_OVERRIDE_FILES:
+        return plm_source_root / "versal" / source.name
+
+    return plm_source_root / "common" / source.name
+
+
+def update_user_compile_sources(
+    user_config: Path,
+    additional_sources: Iterable[str],
+) -> None:
+    entries = sorted(set(additional_sources))
+
+    if not entries:
+        return
+
+    text = user_config.read_text(encoding="utf-8")
+
+    pattern = re.compile(
+        r"set\s*\(\s*USER_COMPILE_SOURCES(?P<body>.*?)\)",
+        flags=re.DOTALL,
+    )
+    match = pattern.search(text)
+
+    if match is None:
+        block = "\nset(USER_COMPILE_SOURCES\n"
+        for entry in entries:
+            block += f'    "${{CMAKE_CURRENT_SOURCE_DIR}}/{entry}"\n'
+        block += ")\n"
+
+        user_config.write_text(
+            text.rstrip() + "\n" + block,
+            encoding="utf-8",
+        )
+        info(f"Created USER_COMPILE_SOURCES in {user_config}")
+        return
+
+    existing_body = match.group("body")
+    existing_entries = set(
+        re.findall(
+            r"(?:common|versal)/[A-Za-z0-9_.+\-/]+\.(?:c|s|S)",
+            existing_body,
+        )
+    )
+
+    merged = sorted(existing_entries.union(entries))
+
+    replacement = "set(USER_COMPILE_SOURCES\n"
+    for entry in merged:
+        replacement += (
+            f'    "${{CMAKE_CURRENT_SOURCE_DIR}}/{entry}"\n'
+        )
+    replacement += ")"
+
+    updated = (
+        text[: match.start()]
+        + replacement
+        + text[match.end() :]
+    )
+
+    user_config.write_text(updated, encoding="utf-8")
+    info(f"Updated USER_COMPILE_SOURCES in {user_config}")
+
+
+def configure_plm_debug_build(plm_source_root: Path) -> None:
+    """Disable optimization and LTO for overlaid PLM user sources."""
+    user_config = plm_source_root / "UserConfig.cmake"
+    cmake_lists = plm_source_root / "CMakeLists.txt"
+
+    if not user_config.is_file():
+        fail(f"Generated UserConfig.cmake not found: {user_config}")
+    if not cmake_lists.is_file():
+        fail(f"Generated CMakeLists.txt not found: {cmake_lists}")
+
+    user_config_text = user_config.read_text(encoding="utf-8")
+
+    # Clean up target-wide flags written by older build-plm revisions. A
+    # link-wide -fno-lto makes the PLM exceed PPU TMR RAM; only user sources
+    # should opt out of LTO.
+    cleaned_user_config = user_config_text
+    for variable in (
+        "USER_COMPILE_OTHER_FLAGS",
+        "USER_LINK_OTHER_FLAGS",
+    ):
+        pattern = re.compile(
+            rf"(?P<opening>set\s*\(\s*{re.escape(variable)}\b)"
+            r"(?P<body>.*?)\)",
+            flags=re.DOTALL,
+        )
+        match = pattern.search(cleaned_user_config)
+        if match is None or "-fno-lto" not in match.group("body"):
+            continue
+
+        cleaned_body = match.group("body").replace("-fno-lto", "")
+        replacement = match.group("opening") + cleaned_body + ")"
+        cleaned_user_config = (
+            cleaned_user_config[:match.start()]
+            + replacement
+            + cleaned_user_config[match.end():]
+        )
+
+    if cleaned_user_config != user_config_text:
+        user_config.write_text(cleaned_user_config, encoding="utf-8")
+        user_config_text = cleaned_user_config
+        info("Removed stale target-wide -fno-lto flags")
+
+    source_match = re.search(
+        r"set\s*\(\s*USER_COMPILE_SOURCES(?P<body>.*?)\)",
+        user_config_text,
+        flags=re.DOTALL,
+    )
+    if source_match is None:
+        info("No overlaid PLM compile sources require debug flags")
+        return
+
+    sources = sorted(
+        set(
+            re.findall(
+                r"(?:common|versal)/[A-Za-z0-9_.+\-/]+\.(?:c|s|S)",
+                source_match.group("body"),
+            )
+        )
+    )
+    if not sources:
+        info("No overlaid PLM compile sources require debug flags")
+        return
+
+    begin_marker = "# build-plm debug sources: begin"
+    end_marker = "# build-plm debug sources: end"
+    lines = [
+        begin_marker,
+        "set_source_files_properties(",
+    ]
+    lines.extend(
+        f'    "${{CMAKE_CURRENT_SOURCE_DIR}}/{source}"'
+        for source in sources
+    )
+    lines.extend(
+        [
+            '    PROPERTIES COMPILE_OPTIONS '
+            '"-O0;-g3;-fno-lto;-fno-omit-frame-pointer"',
+            ")",
+            end_marker,
+        ]
+    )
+    block = "\n".join(lines)
+
+    text = cmake_lists.read_text(encoding="utf-8")
+    existing = re.compile(
+        rf"{re.escape(begin_marker)}.*?{re.escape(end_marker)}",
+        flags=re.DOTALL,
+    )
+    if existing.search(text):
+        updated = existing.sub(block, text, count=1)
+    else:
+        insertion_marker = "add_dependency_on_bsp(_sources)"
+        if insertion_marker not in text:
+            fail(
+                "Could not locate add_dependency_on_bsp(_sources) in "
+                f"{cmake_lists}"
+            )
+        updated = text.replace(
+            insertion_marker,
+            block + "\n\n" + insertion_marker,
+            1,
+        )
+
+    if updated != text:
+        cmake_lists.write_text(updated, encoding="utf-8")
+
+    info(
+        "Configured PLM user-source debug flags "
+        "(-O0 -g3 -fno-lto -fno-omit-frame-pointer) "
+        f"for {len(sources)} source(s)"
+    )
+
+
+def overlay_custom_sources(
+    custom_source_dir: Path,
+    plm_source_root: Path,
+    use_symlinks: bool,
+    copy_linker_script: bool,
+) -> None:
+    if not custom_source_dir.is_dir():
+        fail(f"Custom PLM source directory not found: {custom_source_dir}")
+
+    user_config = plm_source_root / "UserConfig.cmake"
+
+    if not user_config.is_file():
+        fail(f"Generated UserConfig.cmake not found: {user_config}")
+
+    custom_files = collect_custom_sources(custom_source_dir)
+    additional_compile_sources: list[str] = []
+
+    for source in custom_files:
+        destination = destination_for_source(
+            source,
+            custom_source_dir,
+            plm_source_root,
+        )
+
+        symlink_or_copy(source, destination, use_symlinks)
+
+        if source.suffix in {".c", ".S", ".s"}:
+            additional_compile_sources.append(
+                destination.relative_to(plm_source_root).as_posix()
+            )
+
+    custom_linker = custom_source_dir / "lscript.ld"
+    generated_linker = plm_source_root / "versal" / "lscript.ld"
+
+    if copy_linker_script:
+        if not custom_linker.is_file():
+            fail(
+                "--copy-linker-script was requested, but no linker script "
+                f"exists at: {custom_linker}"
+            )
+
+        symlink_or_copy(
+            custom_linker,
+            generated_linker,
+            use_symlink=False,
+        )
+    elif custom_linker.exists():
+        info(
+            f"Ignoring {custom_linker}; use --copy-linker-script to "
+            "replace the generated linker script."
+        )
+
+    update_user_compile_sources(
+        user_config,
+        additional_compile_sources,
+    )
+
+
+
+def patch_plm_module_init(
+    app_common_dir: Path,
+    header_name: str,
+    init_function: str,
+) -> None:
+    module_c = app_common_dir / "xplm_module.c"
+
+    if not module_c.is_file():
+        fail(f"xplm_module.c not found: {module_c}")
+
+    data = module_c.read_text(encoding="utf-8")
+
+    # Add the custom header after the complete conditional include section,
+    # not after the final #include line, which may be inside an #ifdef.
+    include_line = f'#include "{header_name}"'
+
+    if include_line not in data:
+        include_marker = "/************************** Constant Definitions"
+        include_index = data.find(include_marker)
+
+        if include_index < 0:
+            fail(
+                "Could not locate the Constant Definitions marker in "
+                f"{module_c}"
+            )
+
+        data = (
+            data[:include_index]
+            + include_line
+            + "\n\n"
+            + data[include_index:]
+        )
+        info(f"Added {include_line} to {module_c}")
+    else:
+        info(f"{include_line} already exists in {module_c}")
+
+    function_match = re.search(
+        r"\bint\s+XPlm_ModuleInit\s*\([^)]*\)\s*\{",
+        data,
+    )
+    if function_match is None:
+        fail(f"Could not find XPlm_ModuleInit() in {module_c}")
+
+    # Insert before END:. Code after END: is part of the error path and would
+    # overwrite a prior failure status.
+    end_match = re.search(
+        r"^[ \t]*END:[ \t]*$",
+        data[function_match.end():],
+        re.MULTILINE,
+    )
+    if end_match is None:
+        fail(f"Could not find END: label in XPlm_ModuleInit() in {module_c}")
+
+    insert_index = function_match.end() + end_match.start()
+    call_pattern = re.compile(
+        rf"\bStatus\s*=\s*{re.escape(init_function)}\s*\(\s*\)\s*;"
+    )
+
+    if call_pattern.search(data, function_match.end(), insert_index):
+        info(f"{init_function}() is already registered in XPlm_ModuleInit()")
+    else:
+        block = (
+            "\t/** Initialize custom user module */\n"
+            f"\tStatus = {init_function}();\n"
+            "\tif (Status != XST_SUCCESS) {\n"
+            "\t\tgoto END;\n"
+            "\t}\n\n"
+        )
+        data = data[:insert_index] + block + data[insert_index:]
+        info(f"Registered {init_function}() in XPlm_ModuleInit()")
+
+    module_c.write_text(data, encoding="utf-8")
+
+
+def xilplmi_bsp_dir(workspace: Path) -> Path:
+    return workspace / PLATFORM_NAME / PROCESSOR_NAME / DOMAIN_NAME / "bsp"
+
+
+def read_xplmi_max_modules_value(modules_header: Path) -> str:
+    if not modules_header.is_file():
+        return "(15U)"
+    match = re.search(
+        r"^\s*#define\s+XPLMI_MAX_MODULES\s+(.+?)\s*$",
+        modules_header.read_text(encoding="utf-8"),
+        flags=re.MULTILINE,
+    )
+    return match.group(1).strip() if match else "(15U)"
+
+
+def patch_xilplmi_user_module_headers(workspace: Path) -> int:
+    bsp = xilplmi_bsp_dir(workspace)
+    header_pairs = [
+        (bsp / "libsrc/xilplmi/src/common/server/xplmi_cmd.h", bsp / "libsrc/xilplmi/src/common/server/xplmi_modules.h"),
+        (bsp / "libsrc/build_configs/gen_bsp/include/xplmi_cmd.h", bsp / "libsrc/build_configs/gen_bsp/include/xplmi_modules.h"),
+        (bsp / "include/xplmi_cmd.h", bsp / "include/xplmi_modules.h"),
+    ]
+    patched = 0
+    for cmd_header, modules_header in header_pairs:
+        if not cmd_header.is_file():
+            continue
+        data = cmd_header.read_text(encoding="utf-8")
+        if "#define XPLMI_USER_MODULE_START_INDEX" not in data:
+            value = read_xplmi_max_modules_value(modules_header)
+            patch = (
+                "\n/* Workaround for Vitis 2025.2 xilplmi user-module include-order bug. */\n"
+                "#ifndef XPLMI_USER_MODULE_START_INDEX\n"
+                f"#define XPLMI_USER_MODULE_START_INDEX {value}\n"
+                "#endif\n"
+            )
+            guard = re.search(r"^\s*#define\s+XPLMI_CMD_H.*$", data, flags=re.MULTILINE)
+            index = guard.end() if guard else 0
+            cmd_header.write_text(data[:index] + patch + data[index:], encoding="utf-8")
+            info(f"Patched user-module start index into {cmd_header}")
+            patched += 1
+        if modules_header.is_file():
+            modules_data = modules_header.read_text(encoding="utf-8")
+            if "#ifndef XPLMI_USER_MODULE_START_INDEX" not in modules_data:
+                pattern = re.compile(
+                    r"^(\s*#define\s+XPLMI_USER_MODULE_START_INDEX\s+\(\s*XPLMI_MAX_MODULES\s*\)\s*)$",
+                    flags=re.MULTILINE,
+                )
+                match = pattern.search(modules_data)
+                if match:
+                    replacement = "#ifndef XPLMI_USER_MODULE_START_INDEX\n" + match.group(1) + "\n#endif"
+                    modules_header.write_text(pattern.sub(replacement, modules_data, count=1), encoding="utf-8")
+                    info(f"Guarded user-module start index in {modules_header}")
+    return patched
+
+
+def configure_xilplmi_user_modules(platform: object, count: int) -> None:
+    domain = platform.get_domain(name=DOMAIN_NAME)
+    result = domain.set_config(
+        option="lib",
+        lib_name="xilplmi",
+        param="XILPLMI_user_modules_count",
+        value=str(count),
+    )
+    debug(f"XILPLMI_user_modules_count set_config returned: {result!r}")
+
+
+def build_platform_with_user_module_patch(platform: object, workspace: Path, count: Optional[int]) -> None:
+    if count is not None:
+        configure_xilplmi_user_modules(platform, count)
+        generate = getattr(platform, "generate", None)
+        if generate is not None:
+            info("Generating platform sources before applying xilplmi workaround")
+            try:
+                generate()
+            except Exception as error:
+                info(f"platform.generate() reported: {error}; continuing to build/patch retry")
+        patch_xilplmi_user_module_headers(workspace)
+
+    info("Building platform")
+    try:
+        result = platform.build()
+        debug(f"platform.build() returned: {result!r}")
+        if isinstance(result, bool) and not result:
+            raise RuntimeError("platform build failed")
+        if isinstance(result, int) and result != 0:
+            raise RuntimeError(f"platform build failed with return code {result}")
+    except Exception:
+        if count is None:
+            raise
+        info("Initial platform build failed; applying generated-header workaround and retrying once")
+        if patch_xilplmi_user_module_headers(workspace) == 0:
+            info("No generated xilplmi headers were patched before retry")
+        result = platform.build()
+        debug(f"platform.build() retry returned: {result!r}")
+        if isinstance(result, bool) and not result:
+            fail("platform build retry failed")
+        if isinstance(result, int) and result != 0:
+            fail(f"platform build retry failed with return code {result}")
+
+
+def parse_arguments(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create or reuse a Versal PLM workspace, overlay custom source "
+            "files, build plm.elf, optionally build an RPU application, and generate the launch PDI."
+        )
+    )
+
+    parser.add_argument(
+        "workspace",
+        help="Vitis workspace directory",
+    )
+    parser.add_argument(
+        "--xsa",
+        help=(
+            "Hardware XSA. Required when creating or forcibly regenerating "
+            "the platform; optional when reusing an existing platform."
+        ),
+    )
+    parser.add_argument(
+        "--custom-source-dir",
+        default=None,
+        help=(
+            "Directory containing custom PLM source/header files. "
+            "Default: <script-directory>/src"
+        ),
+    )
+    parser.add_argument(
+        "--symlink-sources",
+        action="store_true",
+        help="Symlink custom files into the generated PLM component",
+    )
+    parser.add_argument(
+        "--copy-linker-script",
+        action="store_true",
+        help=(
+            "Replace plm/src/versal/lscript.ld with "
+            "<custom-source-dir>/lscript.ld"
+        ),
+    )
+    parser.add_argument(
+        "--no-custom-sources",
+        action="store_true",
+        help="Build without applying a custom source overlay",
+    )
+    parser.add_argument(
+        "--force-regenerate",
+        action="store_true",
+        help=(
+            "Delete the existing platform and PLM components, then recreate "
+            "them from --xsa before building"
+        ),
+    )
+    parser.add_argument(
+        "--rebuild-platform",
+        action="store_true",
+        help=(
+            "Build and export the existing platform again before building "
+            "PLM"
+        ),
+    )
+    parser.add_argument(
+        "--user-modules-count",
+        type=lambda value: int(value, 0),
+        default=None,
+        help="Configure XILPLMI_user_modules_count and patch the Vitis 2025.2 generated-header bug",
+    )
+    parser.add_argument(
+        "--register-module",
+        default=None,
+        metavar="HEADER:FUNCTION",
+        help="Patch XPlm_ModuleInit() to call a user-module initialization function",
+    )
+    parser.add_argument(
+        "--rpu-source",
+        default=None,
+        help=(
+            "Directory containing RPU C/header/assembly sources, or a Rust "
+            "Cargo workspace containing Cargo.toml"
+        ),
+    )
+    parser.add_argument(
+        "--rpu-elf",
+        default=None,
+        help="Use an existing RPU ELF instead of generating/building an RPU application",
+    )
+
+    parser.add_argument(
+        "--rpu-component-dir",
+        default=None,
+        help=(
+            "Existing Vitis RPU application-component directory containing "
+            "vitis-comp.json. When --rpu-elf is used, the default is inferred "
+            "as <rpu-elf-parent>/.. and the component is symlinked into the "
+            "main workspace so it is visible in Vitis."
+        ),
+    )
+    parser.add_argument(
+        "--rpu-app-name",
+        default=RPU_APPLICATION_NAME_DEFAULT,
+        help=f"RPU application component name (default: {RPU_APPLICATION_NAME_DEFAULT})",
+    )
+    parser.add_argument(
+        "--rpu-platform-name",
+        default=RPU_PLATFORM_NAME_DEFAULT,
+        help=f"RPU platform component name (default: {RPU_PLATFORM_NAME_DEFAULT})",
+    )
+    parser.add_argument(
+        "--rpu-processor",
+        default=RPU_PROCESSOR_NAME_DEFAULT,
+        help=f"RPU processor instance (default: {RPU_PROCESSOR_NAME_DEFAULT})",
+    )
+    parser.add_argument(
+        "--rpu-domain",
+        default=RPU_DOMAIN_NAME_DEFAULT,
+        help=f"RPU standalone domain name (default: {RPU_DOMAIN_NAME_DEFAULT})",
+    )
+    parser.add_argument(
+        "--rpu-template",
+        default=RPU_APPLICATION_TEMPLATE_DEFAULT,
+        help=f"RPU application template (default: {RPU_APPLICATION_TEMPLATE_DEFAULT})",
+    )
+    parser.add_argument(
+        "--rpu-core",
+        choices=("r5-0", "r5-1", "r5-lockstep"),
+        default="r5-0",
+        help="Bootgen core assignment for the RPU ELF (default: r5-0)",
+    )
+    parser.add_argument(
+        "--embed-rpu-in-pdi",
+        action="store_true",
+        help=(
+            "Additionally generate PLM_RPU_PRODUCTION.pdi containing both "
+            "the custom PLM and RPU ELF. The Vitis debug launch still uses "
+            "the PLM-only PDI."
+        ),
+    )
+    parser.add_argument(
+        "--rpu-cargo-package",
+        default=None,
+        help="Rust package/binary name (default: --rpu-app-name)",
+    )
+    parser.add_argument(
+        "--rpu-cargo-target",
+        default="armv7r-none-eabihf",
+        help="Rust target triple (default: armv7r-none-eabihf)",
+    )
+    parser.add_argument(
+        "--rpu-cargo-release",
+        action="store_true",
+        help="Build Rust RPU firmware with Cargo's release profile",
+    )
+    parser.add_argument(
+        "--launch-vitis",
+        action="store_true",
+        help="Launch the Vitis GUI after a successful build",
+    )
+
+    args = parser.parse_args(argv)
+
+    if args.no_custom_sources and args.custom_source_dir:
+        parser.error(
+            "--no-custom-sources cannot be combined with "
+            "--custom-source-dir"
+        )
+
+    if args.no_custom_sources and args.symlink_sources:
+        parser.error(
+            "--no-custom-sources cannot be combined with "
+            "--symlink-sources"
+        )
+
+    if args.no_custom_sources and args.copy_linker_script:
+        parser.error(
+            "--no-custom-sources cannot be combined with "
+            "--copy-linker-script"
+        )
+
+    if args.force_regenerate and not args.xsa:
+        parser.error("--force-regenerate requires --xsa")
+
+    if args.user_modules_count is not None and args.user_modules_count < 0:
+        parser.error("--user-modules-count must be >= 0")
+
+    if args.register_module is not None and ":" not in args.register_module:
+        parser.error("--register-module requires HEADER:FUNCTION")
+
+    if args.rpu_source and args.rpu_elf:
+        parser.error("--rpu-source and --rpu-elf are mutually exclusive")
+
+    if args.rpu_component_dir and not args.rpu_elf:
+        parser.error("--rpu-component-dir requires --rpu-elf")
+
+    if (args.rpu_source or args.rpu_elf) and not args.xsa:
+        parser.error("RPU generation/packaging requires --xsa")
+
+    if args.embed_rpu_in_pdi and not (args.rpu_source or args.rpu_elf):
+        parser.error("--embed-rpu-in-pdi requires --rpu-source or --rpu-elf")
+
+    if args.rpu_source and args.rpu_platform_name == PLATFORM_NAME:
+        parser.error(
+            f"--rpu-platform-name must differ from the PLM platform name "
+            f"'{PLATFORM_NAME}'. Omit the option to use "
+            f"'{RPU_PLATFORM_NAME_DEFAULT}', or choose another unique name. "
+            "The PLM platform contains the PMC domain and cannot be reused "
+            "as the script's RPU platform."
+        )
+
+    if args.rpu_source and args.rpu_app_name in {
+        PLATFORM_NAME,
+        APPLICATION_NAME,
+        args.rpu_platform_name,
+    }:
+        parser.error(
+            "--rpu-app-name must differ from the PLM platform, PLM "
+            "application, and RPU platform component names"
+        )
+
+    if args.register_module is not None and args.user_modules_count is None:
+        args.user_modules_count = 1
+
+    return args
+
+
+def main() -> int:
+    args = parse_arguments(sys.argv[1:])
+
+    script_dir = Path(__file__).resolve().parent
+    workspace = absolute_path(args.workspace)
+
+    xsa: Optional[Path] = None
+    if args.xsa:
+        xsa = absolute_path(args.xsa)
+        if not xsa.is_file():
+            fail(f"XSA not found: {xsa}")
+
+    rpu_source: Optional[Path] = None
+    rpu_source_is_rust = False
+    if args.rpu_source:
+        rpu_source = absolute_path(args.rpu_source)
+        if not rpu_source.is_dir():
+            fail(f"RPU source directory not found: {rpu_source}")
+        rpu_source_is_rust = (rpu_source / "Cargo.toml").is_file()
+
+    requested_rpu_elf: Optional[Path] = None
+    existing_rpu_component_dir: Optional[Path] = None
+    if args.rpu_elf:
+        requested_rpu_elf = absolute_path(args.rpu_elf)
+        if not requested_rpu_elf.is_file():
+            fail(f"RPU ELF not found: {requested_rpu_elf}")
+
+        explicit_component_dir = (
+            absolute_path(args.rpu_component_dir)
+            if args.rpu_component_dir
+            else None
+        )
+        existing_rpu_component_dir = resolve_rpu_component_dir(
+            requested_rpu_elf,
+            explicit_component_dir,
+        )
+
+    if args.no_custom_sources:
+        custom_source_dir: Optional[Path] = None
+    elif args.custom_source_dir:
+        custom_source_dir = absolute_path(args.custom_source_dir)
+    else:
+        custom_source_dir = (script_dir / "src").resolve()
+
+    platform_dir = workspace / PLATFORM_NAME
+    application_dir = workspace / APPLICATION_NAME
+    rpu_platform_dir = workspace / args.rpu_platform_name
+    rpu_application_dir = workspace / args.rpu_app_name
+
+    if args.force_regenerate:
+        info("Force regeneration requested")
+
+        if platform_dir.exists() or platform_dir.is_symlink():
+            info(f"Removing existing platform: {platform_dir}")
+            remove_path(platform_dir)
+
+        if application_dir.exists() or application_dir.is_symlink():
+            info(f"Removing existing PLM application: {application_dir}")
+            remove_path(application_dir)
+
+        if rpu_source is not None or requested_rpu_elf is not None:
+            for label, path in (
+                ("RPU platform", rpu_platform_dir),
+                ("RPU application", rpu_application_dir),
+            ):
+                if path.exists() or path.is_symlink():
+                    info(f"Removing existing {label}: {path}")
+                    remove_path(path)
+
+    platform_exists = platform_dir.is_dir()
+    application_exists = application_dir.is_dir()
+
+    if not platform_exists and xsa is None:
+        fail(
+            f"No existing platform was found at {platform_dir}. "
+            "Provide --xsa to create it."
+        )
+
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    info(f"Workspace: {workspace}")
+
+    if xsa is not None:
+        info(f"XSA: {xsa}")
+    else:
+        info("XSA: not required because the existing platform will be reused")
+
+    if custom_source_dir is None:
+        info("Custom source overlay: disabled")
+    else:
+        info(f"Custom source directory: {custom_source_dir}")
+        info(
+            "Overlay mode: "
+            + ("symlink" if args.symlink_sources else "copy")
+        )
+
+    if rpu_source is not None:
+        info(f"RPU source directory: {rpu_source}")
+        info(
+            "RPU implementation: "
+            + ("Rust/Cargo with generated BSP bindings" if rpu_source_is_rust else "C")
+        )
+        info(f"RPU processor/domain: {args.rpu_processor}/{args.rpu_domain}")
+        info(f"RPU bootgen core: {args.rpu_core}")
+    elif requested_rpu_elf is not None:
+        info(f"Using existing RPU ELF: {requested_rpu_elf}")
+        assert existing_rpu_component_dir is not None
+        info(f"Existing RPU component directory: {existing_rpu_component_dir}")
+        expose_existing_rpu_component(
+            workspace=workspace,
+            component_dir=existing_rpu_component_dir,
+            app_name=args.rpu_app_name,
+        )
+
+    prepare_workspace_for_headless_build(workspace)
+
+    try:
+        import vitis
+    except ImportError as error:
+        raise RuntimeError(
+            "The Vitis Python module is unavailable. Run this script with "
+            "'vitis -s', not the host python3 interpreter."
+        ) from error
+
+    client, owned_server_roots = create_client_and_set_workspace(
+        vitis,
+        workspace,
+    )
+
+    try:
+
+        if platform_exists:
+            info(f"Reusing existing platform component '{PLATFORM_NAME}'")
+            platform = get_existing_component(
+                client,
+                PLATFORM_NAME,
+                "platform",
+            )
+
+            exported_platform = resolve_exported_platform(workspace)
+
+            if args.rebuild_platform or args.user_modules_count is not None:
+                build_platform_with_user_module_patch(
+                    platform, workspace, args.user_modules_count
+                )
+                export_platform(platform)
+                exported_platform = resolve_exported_platform(workspace)
+        else:
+            assert xsa is not None
+            platform = create_platform(client, xsa)
+            build_platform_with_user_module_patch(
+                platform, workspace, args.user_modules_count
+            )
+            export_platform(platform)
+            exported_platform = resolve_exported_platform(workspace)
+
+        info(f"Exported platform: {exported_platform}")
+        add_platform_repository(client, exported_platform)
+
+        if application_exists:
+            info(
+                f"Reusing existing PLM application component "
+                f"'{APPLICATION_NAME}'"
+            )
+            application = get_existing_component(
+                client,
+                APPLICATION_NAME,
+                "application",
+            )
+        else:
+            application = create_plm_application(
+                client,
+                exported_platform,
+            )
+
+        plm_source_root = application_dir / "src"
+
+        if not plm_source_root.is_dir():
+            fail(
+                "The PLM source directory was not found after opening or "
+                f"creating the component: {plm_source_root}"
+            )
+
+        if custom_source_dir is not None:
+            overlay_custom_sources(
+                custom_source_dir=custom_source_dir,
+                plm_source_root=plm_source_root,
+                use_symlinks=args.symlink_sources,
+                copy_linker_script=args.copy_linker_script,
+            )
+
+        configure_plm_debug_build(plm_source_root)
+
+        if args.register_module is not None:
+            header_name, init_function = args.register_module.split(":", 1)
+            patch_plm_module_init(
+                plm_source_root / "common", header_name, init_function
+            )
+
+        plm_elf = application_dir / "build" / "plm.elf"
+
+        if plm_elf.exists() or plm_elf.is_symlink():
+            info(f"Removing stale PLM ELF before build: {plm_elf}")
+            remove_path(plm_elf)
+
+        build_component(application, "PLM application")
+
+        if not plm_elf.is_file():
+            fail(
+                "The PLM build completed, but the output ELF was not found: "
+                f"{plm_elf}"
+            )
+
+        success(f"PLM build complete: {plm_elf}")
+
+        packaged_rpu_elf: Optional[Path] = requested_rpu_elf
+        if rpu_source is not None:
+            assert xsa is not None
+
+            if rpu_platform_dir.is_dir():
+                info(f"Reusing existing RPU platform '{args.rpu_platform_name}'")
+                rpu_platform = get_existing_component(
+                    client, args.rpu_platform_name, "platform"
+                )
+            else:
+                rpu_platform = create_rpu_platform(
+                    client,
+                    xsa,
+                    args.rpu_platform_name,
+                    args.rpu_processor,
+                    args.rpu_domain,
+                )
+
+            build_component(rpu_platform, "RPU platform")
+            export_platform(rpu_platform)
+            rpu_exported_platform = resolve_exported_platform_named(
+                workspace, args.rpu_platform_name
+            )
+            add_platform_repository(client, rpu_exported_platform)
+
+            if rpu_application_dir.is_dir():
+                info(f"Reusing existing RPU application '{args.rpu_app_name}'")
+                rpu_application = get_existing_component(
+                    client, args.rpu_app_name, "application"
+                )
+            else:
+                rpu_application = create_rpu_application(
+                    client,
+                    rpu_exported_platform,
+                    args.rpu_app_name,
+                    args.rpu_domain,
+                    args.rpu_template,
+                )
+
+            rpu_source_root = rpu_application_dir / "src"
+
+            if rpu_source_is_rust:
+                overlay_rust_rpu_sources(
+                    rpu_source,
+                    rpu_source_root,
+                    args.rpu_cargo_package or args.rpu_app_name,
+                    args.symlink_sources,
+                )
+            else:
+                source_absolute = rpu_source.expanduser().absolute()
+                destination_absolute = rpu_source_root.expanduser().absolute()
+
+                if source_absolute == destination_absolute:
+                    info(
+                        "RPU source directory is already the application component "
+                        f"source directory; skipping source overlay: {source_absolute}"
+                    )
+                else:
+                    overlay_rpu_sources(
+                        rpu_source,
+                        rpu_source_root,
+                        args.symlink_sources,
+                    )
+
+
+            packaged_rpu_elf = rpu_application_dir / "build" / f"{args.rpu_app_name}.elf"
+            if packaged_rpu_elf.exists() or packaged_rpu_elf.is_symlink():
+                info(f"Removing stale RPU ELF before build: {packaged_rpu_elf}")
+                remove_path(packaged_rpu_elf)
+
+            if rpu_source_is_rust:
+                linker_script = rpu_source_root / "lscript.ld"
+                if not linker_script.is_file():
+                    fail(
+                        "The Vitis RPU component did not generate its linker script: "
+                        f"{linker_script}"
+                    )
+                cargo_elf = build_rust_rpu_application(
+                    cargo_root=rpu_source,
+                    workspace=workspace,
+                    platform_name=args.rpu_platform_name,
+                    domain_name=args.rpu_domain,
+                    package_name=(
+                        args.rpu_cargo_package or args.rpu_app_name
+                    ),
+                    target_name=args.rpu_cargo_target,
+                    linker_script=linker_script,
+                    release=args.rpu_cargo_release,
+                    features=("remoteproc",),
+                )
+                packaged_rpu_elf.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(cargo_elf, packaged_rpu_elf)
+                info(f"Installed Cargo ELF in Vitis component: {packaged_rpu_elf}")
+            else:
+                build_component(rpu_application, "RPU application")
+
+            if not packaged_rpu_elf.is_file():
+                candidates = sorted((rpu_application_dir / "build").glob("*.elf"))
+                if len(candidates) == 1:
+                    packaged_rpu_elf = candidates[0]
+                else:
+                    fail(
+                        "The RPU build completed, but a unique ELF was not found beneath "
+                        f"{rpu_application_dir / 'build'}"
+                    )
+            success(f"RPU build complete: {packaged_rpu_elf}")
+
+        vitis_pdi: Optional[Path] = None
+        if xsa is not None:
+            # Debug launch: program only the custom PLM. The RPU application is
+            # built as a separate component and is not loaded by the PLM launch.
+            vitis_pdi = generate_custom_plm_pdi(
+                workspace=workspace,
+                xsa=xsa,
+                plm_elf=plm_elf,
+                rpu_elf=None,
+                rpu_core=args.rpu_core,
+                install_for_vitis=True,
+                output_stem="PLM_CUSTOM_JTAG",
+            )
+
+            # Optional production artifact: boot both processors directly from
+            # one PDI, but never install it as the Vitis debug launch PDI.
+            if args.embed_rpu_in_pdi:
+                assert packaged_rpu_elf is not None
+                production_pdi = generate_custom_plm_pdi(
+                    workspace=workspace,
+                    xsa=xsa,
+                    plm_elf=plm_elf,
+                    rpu_elf=packaged_rpu_elf,
+                    rpu_core=args.rpu_core,
+                    install_for_vitis=False,
+                    output_stem="PLM_RPU_PRODUCTION",
+                )
+                success(f"Production combined PDI: {production_pdi}")
+        else:
+            existing_pdis = sorted(
+                (application_dir / "_ide" / "bootimage" / "resources").glob("*.pdi")
+            )
+            if len(existing_pdis) == 1:
+                vitis_pdi = existing_pdis[0]
+                info(f"Reusing existing Vitis launch PDI: {vitis_pdi}")
+            elif args.launch_vitis:
+                info(
+                    "No --xsa was supplied, so a new custom PDI was not generated. "
+                    "The existing launch configuration PDI path will be retained."
+                )
+
+        patch_launch_configs(
+            workspace,
+            vitis_pdi=vitis_pdi,
+            rpu_application_dir=(
+                rpu_application_dir
+                if packaged_rpu_elf is not None
+                else None
+            ),
+            rpu_app_name=(
+                args.rpu_app_name
+                if packaged_rpu_elf is not None
+                else None
+            ),
+            rpu_processor=(
+                args.rpu_processor
+                if packaged_rpu_elf is not None
+                else None
+            ),
+            rpu_elf=packaged_rpu_elf,
+        )
+
+    finally:
+        close_vitis_client(client)
+        terminate_vitis_server_roots(
+            owned_server_roots,
+            "Vitis server started by build-plm",
+        )
+
+        if not vitis_server_root_processes():
+            remove_stale_workspace_locks(workspace)
+
+    if args.launch_vitis:
+        launch_vitis_gui(workspace)
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\n[ERROR] Interrupted", file=sys.stderr)
+        raise SystemExit(130)
+    except Exception as error:
+        print(f"[ERROR] {error}", file=sys.stderr)
+        raise SystemExit(1)

@@ -1,0 +1,17 @@
+# Vitis and hardware-generated output
+build/
+.Xil/
+*.log
+*.jou
+*.str
+*.elf
+*.pdi
+*.bif
+*.bin
+*.xsa
+
+# Editor and OS noise
+.vscode/
+.idea/
+*~
+.DS_Store
