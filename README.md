@@ -12,6 +12,8 @@ This repository contains:
 - A compatible Versal XSA file.
 - `bootgen` available from the Vitis installation.
 - Git submodules initialized.
+- In the Vivado design, enable the PL-side RPU IPI master for channel 1 so the
+  RPU/PLM IPI path exists in the generated hardware handoff.
 
 From the repository root:
 

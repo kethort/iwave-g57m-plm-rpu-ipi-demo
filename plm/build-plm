@@ -926,8 +926,8 @@ def patch_launch_tree(
 ) -> tuple[object, int]:
     if attach_to_running:
         replacements = {
-            "targetsetupmode": "Attach to running target",
-            "setuptype": "Attach to running target",
+            "targetsetupmode": "Attach to Running Target",
+            "setuptype": "Attach to Running Target",
         }
         true_keys: set[str] = set()
         false_keys = {
@@ -1021,7 +1021,7 @@ def patch_launch_tree(
         if is_launch_config:
             if attach_to_running:
                 required_values = {
-                    "targetSetupMode": "Attach to running target",
+                    "targetSetupMode": "Attach to Running Target",
                     "resetEntireSystem": False,
                     "resetProcessor": False,
                     "programDevice": False,
@@ -1081,7 +1081,7 @@ def patch_launch_tree(
 
             if isinstance(attach_options, dict):
                 attach_defaults = {
-                    "targetSetupMode": "Attach to running target",
+                    "targetSetupMode": "Attach to Running Target",
                     "executeScript": False,
                     "scriptPath": "",
                     "resetProcessor": False,
@@ -1153,33 +1153,6 @@ def remove_plm_attach_configuration(data: object) -> tuple[object, int]:
     if removed:
         info("Removed obsolete PLM attach-to-running configuration")
     return data, removed
-
-
-def remove_plm_attach_target_setup(data: object) -> tuple[object, int]:
-    """Remove programming/download metadata from the PLM attach launch."""
-    if not isinstance(data, dict):
-        return data, 0
-
-    changes = 0
-
-    configurations = data.get("configurations")
-    if isinstance(configurations, list):
-        for configuration in configurations:
-            if not isinstance(configuration, dict):
-                continue
-            target_setup_key = next(
-                (
-                    key
-                    for key in configuration
-                    if normalized_key(key) == "targetsetup"
-                ),
-                None,
-            )
-            if target_setup_key is not None:
-                del configuration[target_setup_key]
-                changes += 1
-
-    return data, changes
 
 
 def patch_rpu_source_path_map(
@@ -1323,10 +1296,6 @@ def patch_launch_configs(
                     patched
                 )
                 changes += removed_changes
-                patched, removed_target_setup_changes = (
-                    remove_plm_attach_target_setup(patched)
-                )
-                changes += removed_target_setup_changes
                 if (
                     rpu_processor is not None
                     and rpu_app_name is not None
