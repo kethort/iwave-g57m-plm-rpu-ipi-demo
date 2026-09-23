@@ -1155,55 +1155,36 @@ def remove_plm_attach_configuration(data: object) -> tuple[object, int]:
     return data, removed
 
 
-def patch_rpu_source_path_map(
-    node: object,
+def patch_rpu_primary_source_path_map(
+    data: object,
     path_map: list[dict[str, str]],
 ) -> tuple[object, int]:
-    changes = 0
+    """Patch only the primary RPU attach configuration's source path map."""
+    if not isinstance(data, dict):
+        return data, 0
 
-    if isinstance(node, dict):
-        result: dict[str, object] = {}
+    configurations = data.get("configurations")
+    if not isinstance(configurations, list) or not configurations:
+        return data, 0
 
-        for key, value in node.items():
-            if normalized_key(key) == "pathmap":
-                if value != path_map:
-                    value = path_map
-                    changes += 1
-            else:
-                value, nested_changes = patch_rpu_source_path_map(
-                    value,
-                    path_map,
-                )
-                changes += nested_changes
-            result[key] = value
+    primary_config = configurations[0]
+    if not isinstance(primary_config, dict):
+        return data, 0
 
-        normalized_keys = {normalized_key(key) for key in result}
-        is_launch_config = (
-            "debugtype" in normalized_keys
-            or (
-                "request" in normalized_keys
-                and "type" in normalized_keys
-                and "name" in normalized_keys
-            )
-        )
-        if is_launch_config and "pathmap" not in normalized_keys:
-            result["pathMap"] = path_map
-            changes += 1
+    path_map_key = next(
+        (
+            key
+            for key in primary_config
+            if normalized_key(key) == "pathmap"
+        ),
+        "pathMap",
+    )
 
-        return result, changes
+    if primary_config.get(path_map_key) == path_map:
+        return data, 0
 
-    if isinstance(node, list):
-        result_list: list[object] = []
-        for item in node:
-            patched_item, nested_changes = patch_rpu_source_path_map(
-                item,
-                path_map,
-            )
-            result_list.append(patched_item)
-            changes += nested_changes
-        return result_list, changes
-
-    return node, changes
+    primary_config[path_map_key] = path_map
+    return data, 1
 
 
 
@@ -1268,26 +1249,28 @@ def patch_launch_configs(
             except ValueError:
                 pass
 
-        # Classify by component path for messaging and RPU-specific cleanup.
-        # Both PLM and RPU launches attach to already-running firmware by
-        # default.
+        # Classify by component path. PLM launch metadata is normalized by this
+        # script, while RPU launch metadata is left in the Vitis-generated shape
+        # because that is what works reliably in the IDE.
         is_rpu_launch = path_is_rpu
-        attach_to_running = True
-
-        patched, changes = patch_launch_tree(
-            data,
-            attach_to_running=attach_to_running,
-            pdi_workspace_path=pdi_workspace_path,
-        )
+        patched = data
+        changes = 0
 
         if is_rpu_launch and rpu_path_map is not None:
-            patched, path_map_changes = patch_rpu_source_path_map(
+            patched, path_map_changes = patch_rpu_primary_source_path_map(
                 patched,
                 rpu_path_map,
             )
             changes += path_map_changes
 
         if not is_rpu_launch:
+            patched, launch_changes = patch_launch_tree(
+                patched,
+                attach_to_running=True,
+                pdi_workspace_path=pdi_workspace_path,
+            )
+            changes += launch_changes
+
             try:
                 path.resolve(strict=False).relative_to(
                     (workspace / APPLICATION_NAME).resolve(strict=False)
